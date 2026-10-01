@@ -1,9 +1,12 @@
-# Mangatan: Setup & Documentation
+# Mangatan-Suwayomi: Setup & Documentation
 
 Mangatan is a language-learning tool that creates Yomitan-scannable text overlays directly on top of manga served by **Suwayomi**.
 
+> ### ⚠️ Important Notice for Updates
+> If you are updating from an earlier version or encounter unexpected issues, please **re-clone the repository fresh** (`git clone`) rather than pulling or manually copying files over. This ensures all server backends, package configurations, and userscript assets remain cleanly synchronized.
+
 > ### 💡 Looking for a Simpler Setup?
-> For a streamlined application for reading and mining manga, anime, and novels on all platforms, check out: **[Manatan on GitHub](https://github.com/KolbyML/Manatan)**.
+> For a streamlined application for reading and mining manga, anime, and novels on multiple platforms, check out: **[Manatan](https://github.com/KolbyML/Manatan)** or [Mangatan (Mangayomi fork)](https://github.com/1Selxo/Mangatan)
 
 #### Demo Showcase
 
@@ -40,7 +43,7 @@ Add the following JSON configuration under **Parsing -> Extra Meta**:
 ```json
 [
   {
-    "host": "*://127.0.0.1:4567/manga/*",
+    "host": "*://192.168.0.114:4570/manga/*",
     "allFrames": true,
     "parserClass": "manga-ocr-parser",
     "parseVisibleObserver": true,
@@ -56,48 +59,86 @@ Add the following JSON configuration under **Parsing -> Extra Meta**:
 ### 🎨 Appearance -> Advanced CSS Overrides -> Custom Word CSS
 Add the following styles under **Appearance -> Advanced CSS Overrides -> Custom Word CSS**:
 ```css
-/* 1. Force the entire text box to stay 100% transparent unless hovered or clicked */
+/* 1. Permanent layout: kept 'block' at all times to prevent hover reflow/jitter */
+.manga-ocr-parser .gemini-ocr-text-box {
+    display: block !important;
+    pointer-events: auto !important;
+    user-select: text !important;
+    cursor: text;
+}
+
+/* 2. Instant opacity toggle */
 .manga-ocr-parser .gemini-ocr-text-box:not(:hover):not(.manual-highlight) {
     opacity: 0 !important;
 }
 
-/* 2. Only fix the layout when the text box is actively hovered or clicked */
 .manga-ocr-parser .gemini-ocr-text-box:hover,
 .manga-ocr-parser .gemini-ocr-text-box.manual-highlight {
-    display: block !important;
     opacity: 1 !important;
+    z-index: 9999 !important;
+    background: #ffffff !important;
 }
 
-/* 3. Force vertical text boxes to use proper Japanese Gothic fonts and a default mixed orientation */
+/* 3. Static vertical typography with heavy Manga Gothic */
 .manga-ocr-parser .gemini-ocr-text-vertical {
+    writing-mode: vertical-rl !important;
+    -webkit-writing-mode: vertical-rl !important;
     text-orientation: mixed !important;
-    font-family: "Yu Gothic", "MS Gothic", "Meiryo", "Hiragino Kaku Gothic Pro", "Hiragino Sans", "Noto Sans JP", sans-serif !important;
+
+    /* Punchy Manga Gothic stack (strictly non-serif) */
+    font-family: 
+        "Hiragino Maru Gothic ProN", /* macOS: Gorgeous built-in rounded manga gothic */
+        "BIZ UDPGothic",             /* Windows 10/11: Morisawa universal-design gothic (thick, highly legible) */
+        "Yu Gothic UI",              /* Windows: UI variant (avoids the thin/spindly regular Yu Gothic bug) */
+        "Meiryo",                    /* Windows: Solid, heavy strokes */
+        "Hiragino Sans",             /* macOS: Standard bold gothic fallback */
+        sans-serif !important;
+
+    /* Crucial: Manga bubbles require heavy weight to look authentic and readable */
+    font-weight: 700 !important;
+    line-height: 1.25 !important;
+    color: #000000 !important;
 }
 
-/* 4. Force Jiten parsed words and punctuation to render upright (fixes single ? and !) */
+/* 4. Force question marks, exclamation marks, and Jiten words upright */
 .manga-ocr-parser .gemini-ocr-text-vertical .jiten-word {
     text-orientation: upright !important;
-} 
+}
 ```
 
 ---
 
+## 🔍 Key Features & Supported Engines
 
-## Key Features & Recent Updates
+### 🚀 Available OCR Engines
+All engines automatically download their necessary model weights from Hugging Face on their first run.
 
-### 🔍 OCR Engine Selection (Background Server)
-* **Google Lens (Online):** Cloud-based text recognition leveraging Google's OCR engine. Fast and accurate with no local model setup required, but depends on an active internet connection.
-* **Manga-OCR + Meiki Text Detection:** Highly accurate local OCR. Models automatically download on first run.
-  * [Meiki Text Detection Model](https://huggingface.co/rtr46/meiki.text.detect.v0)
-  * [ONNX Manga-OCR Model (DirectML)](https://huggingface.co/xingliao/manga-ocr-onnx-full)
-* **OneOCR with Preprocessing:** Resizes images to 2500px wide, sharpens the source, performs OCR, and applies a Furigana filter to prevent dictionary selection errors.
+* **PP-OCRv6 Manga (Recommended):**
+  * **Architecture:** Uses DBNet Manga Detector v0.2 + PP-OCRv6 Manga Recognizer ([Kellenok/PP-OCRv6_manga](https://huggingface.co/Kellenok/PP-OCRv6_manga)).
+  * **Acceleration:** DirectML GPU acceleration with automatic CPU fallback.
+  * **Reading Order v2:** Speech balloon clustering with union-find grouping and vertical-priority reading order.
+  * **Memory Management:** Auto-unloads models from VRAM after 10 minutes of standby.
+  * **Filtering:** Built-in furigana pair detection and suppression.
+
+* **Manga-OCR DirectML (Fast Local GPU):**
+  * **Architecture:** Meiki Small v0 detection + AngleNet 96x96 FP16 deskewing + TrOCR ONNX recognition ([xingliao/manga-ocr-onnx-full](https://huggingface.co/xingliao/manga-ocr-onnx-full)).
+  * **Features:** 4-point perspective warp for angled/tilted speech, DirectML GPU acceleration, and 10-minute standby auto-unload.
+
+* **Manga-OCR Torch (Local CPU):**
+  * **Architecture:** Meiki Small v0 ONNX detection ([rtr46/meiki.text.detect.v0](https://huggingface.co/rtr46/meiki.text.detect.v0)) + AngleNet deskewing ([Kellenok/anglenet](https://huggingface.co/Kellenok/anglenet)) + PyTorch Manga-OCR using safetensors weights ([tatsumoto/manga-ocr-base](https://huggingface.co/tatsumoto/manga-ocr-base)).
+  * **Features:** Perspective deskewing, mechanical edge noise filtering, and droplet character suppression.
+
+* **Google Lens (Online / Cloud):**
+  * **Architecture:** High-speed cloud recognition via native Lens Protobuf protocol.
+  * **Features:** Adaptive Lanczos upscaling for low-res scans, server-side concurrency throttling, and automatic retry backoff. Requires an active internet connection.
+
+### 📜 Aspect-Ratio-Aware Webtoon Strip Chunking
+Tall vertical webtoon strips are automatically detected by aspect ratio and processed through an intelligent sliding window with boundary overlap deduplication, preventing split speech bubbles across all backends.
 
 ### 🎴 Advanced Mining & Editing
 * **Editable Textboxes:** Double-click any textbox to edit or correct OCR mistakes. Changes sync directly to the background server's local cache.
 * **Merging & Deleting:** Hold your designated modifier keys (default: `Ctrl` to merge, `Alt` to delete) or use the mobile FAB menu to adjust box layouts.
 * **Anki Image Export:** Includes an active image picker to specify which page gets cropped during dual-page layouts.
-
-### 🎨 Visuals & Controls
 * **FAB Menu:** Easily toggle between Edit, Merge, and Delete modes, or quick-trigger the Anki export.
 
 ---
@@ -126,11 +167,10 @@ This option uses **[uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 | Processing Engine | Host System Requirements | Launch Command |
 | :--- | :--- | :--- |
-| **Google Lens** | Active Internet Connection | `uv run server.py` |
-| **OneOCR** | Standard CPU | `uv run server.py -e=oneocr` |
-| **OneOCR (with Furigana Filter)** | Standard CPU | `uv run server.py -e=oneocrfurigana` |
-| **Manga-OCR (CPU)** | Standard CPU | `uv run server.py -e=mangaocr` |
-| **Manga-OCR-DirectML (Fast)** | Windows GPU (NVIDIA, AMD, Intel) | `uv run server.py -e=mangaocrdirectml` |
+| **Google Lens (Online)** | Active Internet Connection | `uv run server.py -e=googlelens` *(or `uv run server.py`)* |
+| **PP-OCRv6 Manga (Recommended-Fast)** | Windows GPU (DirectML) or CPU | `uv run server.py -e=ppocrv6manga` |
+| **Manga-OCR DirectML (Fast GPU)** | Windows GPU (NVIDIA, AMD, Intel) | `uv run server.py -e=mangaocrdirectml` |
+| **Manga-OCR (CPU Torch)** | Standard CPU | `uv run server.py -e=mangaocr` |
 
 ---
 
@@ -167,13 +207,12 @@ Use this if you prefer running local OCR (OneOCR) utilizing native Python packag
    *(Or launch `runme(local-server).bat` on Windows)*
 5. Ensure the **OCR Server URL** in your Tampermonkey userscript settings (gear icon) is set to `http://127.0.0.1:3000`.
 
-
 ---
 
 ## 📱 Mobile & Remote Setup Options
 
 > ### ⚠️ Mobile Recommendation Disclaimer
-> Setting up node, Java, and background server processes inside Termux is complex, prone to performance issues, and resource-heavy on mobile hardware. If you are looking for a high-quality mobile reading experience, utilizing dedicated native apps is strongly recommended over this manual local server workflow:
+> Setting up Node, Java, and background server processes inside Termux is complex, prone to performance issues, and resource-heavy on mobile hardware. If you are looking for a high-quality mobile reading experience, utilizing dedicated native apps is strongly recommended over this manual local server workflow:
 > * **For Android:** Use **[Chimahon](https://github.com/sohilsayed/Chimahon)** (a specialized Mihon/Komikku immersion fork with native Yomitan dictionary lookup, Mokuro support, novel EPUB reader, and instant card mining).
 > * **For Android & iOS:** Use **[Manatan](https://github.com/KolbyML/Manatan)** (the streamlined, cross-platform application for reading and language immersion on all platforms).
 > 
@@ -196,14 +235,8 @@ Runs both Suwayomi-Server and the background OCR server directly on your mobile 
 4. **Configure Android WebAssembly Compatibility:** Run these dependencies individually in your second Termux session:
    ```sh
    npm install --cpu=wasm32 sharp --force
-   ```
-   ```sh
    npm install @img/sharp-wasm32 --force
-   ```
-   ```sh
    rm -rf node_modules package-lock.json
-   ```
-   ```sh
    npm install --force
    ```
 
@@ -226,7 +259,7 @@ This allows hosting both Suwayomi-Server and the OCR Server on a powerful deskto
    * Open `server.conf` and change `server.ip` to match your desktop's local network IP address (e.g., `192.168.1.50`).
    * Launch your desktop OCR server with the IP command argument:
      ```bash
-     node server.js --ip <your_desktop_ip>
+     uv run server.py --ip <your_desktop_ip>
      ```
 2. **Mobile Configuration:**
    * Open the Tampermonkey dashboard on your mobile device.
@@ -244,11 +277,10 @@ You can use **NSSM** (Non-Sucking Service Manager) to run both utilities in the 
 * **OCR Startup (`ocr_start.bat`):**
   ```bat
   @echo off
-  cd /d "<path-to-suwayomi-server-folder>\ocr-server-legacy"
-  node server.js --cache-path "<your-cache-path>" --ip <your-ip-address> --port <your-port>
+  cd /d "<path-to-mangatan-ocr-server-folder>"
+  uv run server.py -e=ppocrv6manga --ip <your-ip-address> --port <your-port>
   ```
-
 ---
 
 ## 💾 Caching & Cache Management
-* The OCR server automatically creates and writes to `ocr-cache.json` in its root folder to store text changes.
+* The OCR server automatically creates and writes to `ocr-cache.json` in its root folder to store OCR results and manual box edits across reader sessions.

@@ -1,48 +1,46 @@
-# --- START OF FILE server.py ---
-
-# TODO: cache purge <-- DONE
-# TODO: auto-merge logic <-- UPGRADED WITH ROBUST SORTING
-# TODO: Add context logging <-- DONE
-# TODO: Save context to cache file <-- DONE
+# -*- coding: utf-8 -*-
 
 import argparse
 import base64
+from collections import defaultdict
 import io
 import json
 import os
+import re
 import threading
-import traceback
 import time
-import requests
+import traceback
 from urllib.parse import quote
-from collections import defaultdict
 
 import aiohttp
-from engines import Engine, initialize_engine
+import requests
 from flask import Flask, jsonify, request, send_file
 from PIL import Image
 from waitress import serve
 
-# region Config
+from engines import Engine, initialize_engine
+
+# ==============================================================================
+# 1. Configuration & Server Setup
+# ==============================================================================
 IP_ADDRESS = "0.0.0.0"
 PORT = 3000
 CACHE_FILE_PATH = os.path.join(os.getcwd(), "ocr-cache.json")
 UPLOAD_FOLDER = "uploads"
 IMAGE_CACHE_FOLDER = "image_cache"
+
 AUTO_MERGE_CONFIG = {
     "enabled": True,
-    "dist_k": 1.2,
-    "font_ratio": 1.3,
+    "dist_k": 1.25,                  # Distance factor between lines
+    "font_ratio": 1.6,               # Font size variance tolerance
     "perp_tol": 0.5,
     "overlap_min": 0.1,
-    "min_line_ratio": 0.5,
-    "font_ratio_for_mixed": 1.1,
-    "mixed_min_overlap_ratio": 0.5,
+    "min_line_ratio": 0.4,           # Headroom for short lines
+    "font_ratio_for_mixed": 1.3,
+    "mixed_min_overlap_ratio": 0.3,
     "add_space_on_merge": False,
 }
-# endregion
 
-# region Setup
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
@@ -55,24 +53,23 @@ cache_lock = threading.Lock()
 active_job_count = 0
 active_job_lock = threading.Lock()
 ocr_engine: Engine
-# endregion
 
 
-# region Auto-Merge Logic (Ported from UserScript)
-
-
+# ==============================================================================
+# 2. Geometry & Helper Data Structures
+# ==============================================================================
 class UnionFind:
-    def __init__(self, size):
+    def __init__(self, size: int):
         self.parent = list(range(size))
         self.rank = [0] * size
 
-    def find(self, i):
+    def find(self, i: int) -> int:
         if self.parent[i] == i:
             return i
         self.parent[i] = self.find(self.parent[i])
         return self.parent[i]
 
-    def union(self, i, j):
+    def union(self, i: int, j: int) -> bool:
         root_i = self.find(i)
         root_j = self.find(j)
         if root_i != root_j:
@@ -87,17 +84,166 @@ class UnionFind:
         return False
 
 
-def _median(data):
+def _median(data: list[float]) -> float:
     if not data:
-        return 0
+        return 0.0
     sorted_data = sorted(data)
     mid = len(sorted_data) // 2
     if len(sorted_data) % 2 == 0:
-        return (sorted_data[mid - 1] + sorted_data[mid]) / 2.0
-    return sorted_data[mid]
+        return float((sorted_data[mid - 1] + sorted_data[mid]) / 2.0)
+    return float(sorted_data[mid])
 
 
-def _group_ocr_data(lines, natural_width, natural_height, config):
+def _sanitize_bubble(item: dict) -> dict:
+    """Ensures all fields are standard JSON-serializable Python native types."""
+    bbox = item["tightBoundingBox"]
+    cleaned = {
+        "text": str(item.get("text", "")),
+        "tightBoundingBox": {
+            "x": float(bbox["x"]),
+            "y": float(bbox["y"]),
+            "width": float(bbox["width"]),
+            "height": float(bbox["height"]),
+        },
+        "orientation": float(item.get("orientation", 90.0 if bbox["height"] > bbox["width"] else 0.0)),
+        "font_size": float(item.get("font_size", 0.04)),
+        "confidence": float(item.get("confidence", 0.95))
+    }
+    if "isMerged" in item:
+        cleaned["isMerged"] = bool(item["isMerged"])
+    if "forcedOrientation" in item:
+        cleaned["forcedOrientation"] = str(item["forcedOrientation"])
+    return cleaned
+
+
+# ==============================================================================
+# 3. Furigana & Spatial Deduplication Logic
+# ==============================================================================
+def _is_probable_furigana(candidate_line: dict, bubble_lines: list[dict], is_vertical: bool = True) -> bool:
+    """Returns True if candidate_line is ruby furigana rather than a dialogue column."""
+    text = str(candidate_line.get("text", "")).strip()
+    if not text:
+        return True
+
+    # Rule 1: Furigana never contains dialogue punctuation or quotes
+    dialogue_marks = {
+        '？', '！', '!', '?', '…', '‥', '「', '」', '『', '』',
+        '—', '─', '―', '♡', '♥', '♪', '~', '～', '。', '、'
+    }
+    if any(mark in text for mark in dialogue_marks):
+        return False
+
+    # Rule 2: Furigana almost never contains Kanji
+    has_kanji = any(('\u4e00' <= ch <= '\u9fff') or ('\u3400' <= ch <= '\u4dbf') for ch in text)
+    if has_kanji:
+        return False
+
+    # Rule 3: Thickness comparison
+    c_box = candidate_line["tightBoundingBox"]
+    c_thick = c_box["width"] if is_vertical else c_box["height"]
+
+    bubble_thicknesses = [
+        (l["tightBoundingBox"]["width"] if is_vertical else l["tightBoundingBox"]["height"])
+        for l in bubble_lines
+    ]
+    median_thick = _median(bubble_thicknesses)
+
+    # Real furigana character width is < 65% of main dialogue column thickness
+    if median_thick > 0 and (c_thick / median_thick) < 0.65:
+        return True
+
+    return False
+
+
+def _deduplicate_raw_lines(lines: list[dict], natural_width: int, natural_height: int) -> list[dict]:
+    """Suppresses boundary-split sub-boxes and spatial duplicates across chunk overlaps."""
+    if not lines or len(lines) < 2:
+        return lines
+
+    items = []
+    for line in lines:
+        bbox = line["tightBoundingBox"]
+        px_x1 = float(bbox["x"] * natural_width)
+        px_y1 = float(bbox["y"] * natural_height)
+        px_x2 = float((bbox["x"] + bbox["width"]) * natural_width)
+        px_y2 = float((bbox["y"] + bbox["height"]) * natural_height)
+        area = max(1.0, (px_x2 - px_x1) * (px_y2 - px_y1))
+
+        raw_text = str(line.get("text", "")).strip()
+        clean_text = re.sub(r'[\s\u200b\u3000\-_~\u2665\u2661!\uff01?\uff1f\u30fc\u2014\u2015]+', '', raw_text)
+
+        items.append({
+            "line": line,
+            "box": [px_x1, px_y1, px_x2, px_y2],
+            "area": area,
+            "text": raw_text,
+            "clean_text": clean_text
+        })
+
+    items.sort(key=lambda item: item["area"], reverse=True)
+    kept_items = []
+
+    while items:
+        current = items.pop(0)
+        curr_box = list(current["box"])
+        curr_text = current["text"]
+        curr_clean = current["clean_text"]
+        remaining = []
+
+        for other in items:
+            other_box = other["box"]
+            other_text = other["text"]
+            other_clean = other["clean_text"]
+
+            ix1 = max(curr_box[0], other_box[0])
+            iy1 = max(curr_box[1], other_box[1])
+            ix2 = min(curr_box[2], other_box[2])
+            iy2 = min(curr_box[3], other_box[3])
+
+            iw = max(0.0, ix2 - ix1)
+            ih = max(0.0, iy2 - iy1)
+            inter_area = iw * ih
+
+            area_curr = (curr_box[2] - curr_box[0]) * (curr_box[3] - curr_box[1])
+            area_other = (other_box[2] - other_box[0]) * (other_box[3] - other_box[1])
+            min_area = max(1.0, min(area_curr, area_other))
+            union_area = (area_curr + area_other - inter_area)
+
+            ios = inter_area / min_area
+            iou = (inter_area / union_area) if union_area > 0 else 0.0
+
+            is_same_text = (curr_clean == other_clean) and len(curr_clean) > 0
+            is_sub_text = (other_clean in curr_clean or curr_clean in other_clean) and min(len(curr_clean), len(other_clean)) > 0
+
+            if (iou >= 0.70) or (ios >= 0.85) or (is_same_text and ios >= 0.30) or (is_sub_text and ios >= 0.45):
+                curr_box[0] = min(curr_box[0], other_box[0])
+                curr_box[1] = min(curr_box[1], other_box[1])
+                curr_box[2] = max(curr_box[2], other_box[2])
+                curr_box[3] = max(curr_box[3], other_box[3])
+
+                if len(other_text) > len(curr_text):
+                    current["line"]["text"] = other_text
+                    curr_text = other_text
+                    curr_clean = other_clean
+            else:
+                remaining.append(other)
+
+        w_px = curr_box[2] - curr_box[0]
+        h_px = curr_box[3] - curr_box[1]
+        current["line"]["tightBoundingBox"] = {
+            "x": float(curr_box[0] / natural_width),
+            "y": float(curr_box[1] / natural_height),
+            "width": float(w_px / natural_width),
+            "height": float(h_px / natural_height),
+        }
+        kept_items.append(current["line"])
+        items = remaining
+
+    return kept_items
+
+
+def _group_ocr_data(lines: list[dict], natural_width: int, natural_height: int, config: dict) -> list[list[dict]]:
+    """Clusters neighboring text lines within dialogue bubbles."""
     if not lines or len(lines) < 2 or not natural_width or not natural_height:
         return [[line] for line in lines]
 
@@ -105,20 +251,20 @@ def _group_ocr_data(lines, natural_width, natural_height, config):
     processed_lines = []
     for index, line in enumerate(lines):
         bbox = line["tightBoundingBox"]
-        pixel_top = bbox["y"] * natural_height
-        pixel_bottom = (bbox["y"] + bbox["height"]) * natural_height
-        norm_scale = 1000 / natural_width
+        pixel_top = float(bbox["y"] * natural_height)
+        pixel_bottom = float((bbox["y"] + bbox["height"]) * natural_height)
+        norm_scale = 1000.0 / natural_width
 
         normalized_bbox = {
-            "x": (bbox["x"] * natural_width) * norm_scale,
-            "y": (bbox["y"] * natural_height) * norm_scale,
-            "width": (bbox["width"] * natural_width) * norm_scale,
-            "height": (bbox["height"] * natural_height) * norm_scale,
+            "x": float((bbox["x"] * natural_width) * norm_scale),
+            "y": float((bbox["y"] * natural_height) * norm_scale),
+            "width": float((bbox["width"] * natural_width) * norm_scale),
+            "height": float((bbox["height"] * natural_height) * norm_scale),
         }
         normalized_bbox["right"] = normalized_bbox["x"] + normalized_bbox["width"]
         normalized_bbox["bottom"] = normalized_bbox["y"] + normalized_bbox["height"]
 
-        is_vertical = normalized_bbox["width"] <= normalized_bbox["height"]
+        is_vertical = line.get("orientation") == 90.0 or (normalized_bbox["width"] <= normalized_bbox["height"])
         font_size = normalized_bbox["width"] if is_vertical else normalized_bbox["height"]
 
         processed_lines.append({
@@ -160,9 +306,9 @@ def _group_ocr_data(lines, natural_width, natural_height, config):
 
         primary_h = [l for l in horizontal_lines if l["bbox"]["height"] >= initial_median_h * config["min_line_ratio"]]
         primary_v = [l for l in vertical_lines if l["bbox"]["width"] >= initial_median_w * config["min_line_ratio"]]
-        
-        robust_median_h = _median([l["bbox"]["height"] for l in primary_h]) or initial_median_h or 20
-        robust_median_w = _median([l["bbox"]["width"] for l in primary_v]) or initial_median_w or 20
+
+        robust_median_h = _median([l["bbox"]["height"] for l in primary_h]) or initial_median_h or 20.0
+        robust_median_w = _median([l["bbox"]["width"] for l in primary_v]) or initial_median_w or 20.0
 
         for i in range(len(chunk_lines)):
             for j in range(i + 1, len(chunk_lines)):
@@ -172,26 +318,33 @@ def _group_ocr_data(lines, natural_width, natural_height, config):
 
                 is_a_primary = line_a["font_size"] >= (robust_median_w if line_a["is_vertical"] else robust_median_h) * config["min_line_ratio"]
                 is_b_primary = line_b["font_size"] >= (robust_median_w if line_b["is_vertical"] else robust_median_h) * config["min_line_ratio"]
-                
+
                 font_ratio_threshold = config["font_ratio"]
                 if is_a_primary != is_b_primary:
                     font_ratio_threshold = config["font_ratio_for_mixed"]
-                
+
+                if line_a["font_size"] == 0 or line_b["font_size"] == 0:
+                    continue
+
                 font_ratio = max(line_a["font_size"] / line_b["font_size"], line_b["font_size"] / line_a["font_size"])
                 if font_ratio > font_ratio_threshold:
                     continue
 
-                dist_threshold = (robust_median_w if line_a["is_vertical"] else robust_median_h) * config["dist_k"]
-                
-                if line_a["is_vertical"]:
-                    reading_gap = max(0, max(line_a["bbox"]["x"], line_b["bbox"]["x"]) - min(line_a["bbox"]["right"], line_b["bbox"]["right"]))
-                    perp_overlap = max(0, min(line_a["bbox"]["bottom"], line_b["bbox"]["bottom"]) - max(line_a["bbox"]["y"], line_b["bbox"]["y"]))
-                else:
-                    reading_gap = max(0, max(line_a["bbox"]["y"], line_b["bbox"]["y"]) - min(line_a["bbox"]["bottom"], line_b["bbox"]["bottom"]))
-                    perp_overlap = max(0, min(line_a["bbox"]["right"], line_b["bbox"]["right"]) - max(line_a["bbox"]["x"], line_b["bbox"]["x"]))
+                local_font_size = max(line_a["font_size"], line_b["font_size"])
+                fallback_median = robust_median_w if line_a["is_vertical"] else robust_median_h
+                dist_threshold = max(local_font_size, fallback_median) * config["dist_k"]
 
-                smaller_perp_size = min(line_a["bbox"]["height"] if line_a["is_vertical"] else line_a["bbox"]["width"],
-                                        line_b["bbox"]["height"] if line_b["is_vertical"] else line_b["bbox"]["width"])
+                if line_a["is_vertical"]:
+                    reading_gap = max(0.0, max(line_a["bbox"]["x"], line_b["bbox"]["x"]) - min(line_a["bbox"]["right"], line_b["bbox"]["right"]))
+                    perp_overlap = max(0.0, min(line_a["bbox"]["bottom"], line_b["bbox"]["bottom"]) - max(line_a["bbox"]["y"], line_b["bbox"]["y"]))
+                else:
+                    reading_gap = max(0.0, max(line_a["bbox"]["y"], line_b["bbox"]["y"]) - min(line_a["bbox"]["bottom"], line_b["bbox"]["bottom"]))
+                    perp_overlap = max(0.0, min(line_a["bbox"]["right"], line_b["bbox"]["right"]) - max(line_a["bbox"]["x"], line_b["bbox"]["x"]))
+
+                smaller_perp_size = min(
+                    line_a["bbox"]["height"] if line_a["is_vertical"] else line_a["bbox"]["width"],
+                    line_b["bbox"]["height"] if line_b["is_vertical"] else line_b["bbox"]["width"]
+                )
 
                 if reading_gap > dist_threshold:
                     continue
@@ -199,7 +352,7 @@ def _group_ocr_data(lines, natural_width, natural_height, config):
                     continue
                 if is_a_primary != is_b_primary and smaller_perp_size > 0 and (perp_overlap / smaller_perp_size < config["mixed_min_overlap_ratio"]):
                     continue
-                
+
                 uf.union(i, j)
 
         temp_groups = defaultdict(list)
@@ -215,73 +368,334 @@ def _group_ocr_data(lines, natural_width, natural_height, config):
         current_line_index = chunk_end_index + 1
 
     if is_debug_mode:
-        print(f"[AutoMerge] Grouping finished. Initial: {len(lines)}, Final groups: {len(all_groups)} (in {chunks_processed} chunk(s))")
+        print(f"[AutoMerge] Grouping: {len(lines)} lines -> {len(all_groups)} groups across {chunks_processed} chunk(s).")
     return all_groups
 
 
-def auto_merge_ocr_data(lines, natural_width, natural_height, config):
+# ==============================================================================
+# 4. Post-Merge Conflict Resolution & Auto-Merge Pipeline
+# ==============================================================================
+def _resolve_merged_bubble_conflicts(bubbles: list[dict], natural_width: int, natural_height: int) -> list[dict]:
+    """
+    Post-Merge Deduplication (Step 6):
+    1. Resolves orientation collisions: In Japanese manga, vertical speech bubbles
+       trump spurious cross-slicing horizontal ghost detections in the same region.
+    2. Drops residual multi-column furigana bubbles enclosed by main dialogue bubbles.
+    3. Merges spatial overlaps and substring duplicates.
+    """
+    if not bubbles or len(bubbles) < 2:
+        return bubbles
+
+    items = []
+    for b in bubbles:
+        box = b["tightBoundingBox"]
+        px_x1 = box["x"] * natural_width
+        px_y1 = box["y"] * natural_height
+        px_x2 = (box["x"] + box["width"]) * natural_width
+        px_y2 = (box["y"] + box["height"]) * natural_height
+        area = max(1.0, (px_x2 - px_x1) * (px_y2 - px_y1))
+
+        text = str(b.get("text", "")).strip()
+        is_vert = b.get("forcedOrientation") == "vertical" or b.get("orientation") == 90.0 or ((px_y2 - px_y1) >= (px_x2 - px_x1))
+
+        has_kanji = any(('\u4e00' <= ch <= '\u9fff') or ('\u3400' <= ch <= '\u4dbf') for ch in text)
+        is_pure_kana = bool(text) and all(
+            ('\u3040' <= ch <= '\u309f') or ('\u30a0' <= ch <= '\u30ff') or ch in ' 　…‥・'
+            for ch in text
+        )
+
+        items.append({
+            "bubble": b,
+            "box": [px_x1, px_y1, px_x2, px_y2],
+            "area": area,
+            "text": text,
+            "is_vertical": is_vert,
+            "has_kanji": has_kanji,
+            "is_pure_kana": is_pure_kana
+        })
+
+    # Sort largest area first
+    items.sort(key=lambda it: it["area"], reverse=True)
+    kept = []
+
+    while items:
+        curr = items.pop(0)
+        curr_b = curr["bubble"]
+        curr_box = list(curr["box"])
+        curr_vert = curr["is_vertical"]
+        curr_text = curr["text"]
+        remaining = []
+
+        for other in items:
+            other_b = other["bubble"]
+            other_box = other["box"]
+            other_vert = other["is_vertical"]
+            other_text = other["text"]
+
+            ix1 = max(curr_box[0], other_box[0])
+            iy1 = max(curr_box[1], other_box[1])
+            ix2 = min(curr_box[2], other_box[2])
+            iy2 = min(curr_box[3], other_box[3])
+
+            iw = max(0.0, ix2 - ix1)
+            ih = max(0.0, iy2 - iy1)
+            inter_area = iw * ih
+
+            area1 = (curr_box[2] - curr_box[0]) * (curr_box[3] - curr_box[1])
+            area2 = (other_box[2] - other_box[0]) * (other_box[3] - other_box[1])
+            min_area = max(1.0, min(area1, area2))
+            union_area = area1 + area2 - inter_area
+
+            iou = (inter_area / union_area) if union_area > 0 else 0.0
+            ios = inter_area / min_area
+
+            # --- RULE A: Enclosed Furigana Bubble Drop (e.g. '大かなし ようせい' inside '小鳥遊さん...') ---
+            if ios >= 0.70:
+                if curr["has_kanji"] and other["is_pure_kana"]:
+                    # 'other' is an enclosed furigana cluster inside main kanji dialogue -> discard 'other'
+                    continue
+                if other["has_kanji"] and curr["is_pure_kana"]:
+                    # 'curr' is the furigana cluster -> replace 'curr' with 'other'
+                    curr = other
+                    curr_b = other["bubble"]
+                    curr_box = list(other["box"])
+                    curr_vert = other["is_vertical"]
+                    curr_text = other["text"]
+                    continue
+
+            # --- RULE B: Cross-Orientation Collision (Ghost Horizontal vs Canonical Vertical) ---
+            # Catches: 雑誌生活用徒とのはの vs この子は生徒会の雑用, 溝生私上流徒とは vs 私は生徒会の溝上です
+            if curr_vert != other_vert and (iou >= 0.40 or ios >= 0.55):
+                # Vertical manga dialogue always supersedes spurious horizontal line sweeps
+                if not curr_vert and other_vert:
+                    curr = other
+                    curr_b = other["bubble"]
+                    curr_box = list(other["box"])
+                    curr_vert = other["is_vertical"]
+                    curr_text = other["text"]
+                # The conflicting horizontal ghost is discarded
+                continue
+
+            # --- RULE C: Substring & Duplicate Merges ---
+            c_clean = re.sub(r'[\s\u200b\u3000]+', '', curr_text)
+            o_clean = re.sub(r'[\s\u200b\u3000]+', '', other_text)
+            is_same = (c_clean == o_clean) and len(c_clean) > 0
+            is_sub = (o_clean in c_clean or c_clean in o_clean) and min(len(c_clean), len(o_clean)) > 0
+
+            if (iou >= 0.65) or (ios >= 0.85) or (is_same and ios >= 0.30) or (is_sub and ios >= 0.50):
+                curr_box[0] = min(curr_box[0], other_box[0])
+                curr_box[1] = min(curr_box[1], other_box[1])
+                curr_box[2] = max(curr_box[2], other_box[2])
+                curr_box[3] = max(curr_box[3], other_box[3])
+                if len(other_text) > len(curr_text) and not is_sub:
+                    curr_b["text"] = other_text
+                    curr_text = other_text
+            else:
+                remaining.append(other)
+
+        curr_b["tightBoundingBox"] = {
+            "x": float(curr_box[0] / natural_width),
+            "y": float(curr_box[1] / natural_height),
+            "width": float((curr_box[2] - curr_box[0]) / natural_width),
+            "height": float((curr_box[3] - curr_box[1]) / natural_height),
+        }
+        kept.append(curr_b)
+        items = remaining
+
+    return kept
+
+
+def auto_merge_ocr_data(lines: list[dict], natural_width: int, natural_height: int, config: dict) -> list[dict]:
+    if not lines:
+        return []
+
+    # Step 1: Pre-suppress spatial duplicates and boundary-split sub-boxes
+    lines = _deduplicate_raw_lines(lines, natural_width, natural_height)
+
+    # Step 2: Cluster lines into dialogue bubble groups
     groups = _group_ocr_data(lines, natural_width, natural_height, config)
+
+    # Step 2.5: Absorb enclosed orphan dialogue lines & DISCARD Furigana
+    multi_groups = [g for g in groups if len(g) >= 2]
+    single_groups = [g for g in groups if len(g) == 1]
+
+    handled_singles = set()
+    if multi_groups and single_groups:
+        for s_idx, sg in enumerate(single_groups):
+            s_line = sg[0]
+            s_box = s_line["tightBoundingBox"]
+            s_cx = s_box["x"] + s_box["width"] / 2.0
+            s_cy = s_box["y"] + s_box["height"] / 2.0
+            s_vert = s_line.get("orientation") == 90.0 or (s_box["height"] >= s_box["width"])
+
+            for mg in multi_groups:
+                m_bboxes = [l["tightBoundingBox"] for l in mg]
+                min_x = min(b["x"] for b in m_bboxes)
+                max_x = max(b["x"] + b["width"] for b in m_bboxes)
+                min_y = min(b["y"] for b in m_bboxes)
+                max_y = max(b["y"] + b["height"] for b in m_bboxes)
+
+                mg_vert_count = sum(
+                    1 for l in mg
+                    if l.get("orientation") == 90.0 or (l["tightBoundingBox"]["height"] >= l["tightBoundingBox"]["width"])
+                )
+                mg_is_vert = mg_vert_count >= (len(mg) - mg_vert_count)
+
+                if s_vert == mg_is_vert:
+                    pad_x = (max_x - min_x) * 0.08
+                    pad_y = (max_y - min_y) * 0.08
+                    if (min_x - pad_x <= s_cx <= max_x + pad_x) and (min_y - pad_y <= s_cy <= max_y + pad_y):
+                        # Identified as Furigana -> mark as handled so it is DISCARDED
+                        if _is_probable_furigana(s_line, mg, is_vertical=mg_is_vert):
+                            handled_singles.add(s_idx)
+                            if is_debug_mode:
+                                print(f"[AutoMerge] Discarded Furigana: '{s_line.get('text')}'")
+                            break
+
+                        mg.append(s_line)
+                        handled_singles.add(s_idx)
+                        break
+
+    groups = multi_groups + [sg for idx, sg in enumerate(single_groups) if idx not in handled_singles]
+
     final_merged_data = []
 
     for group in groups:
         if len(group) == 1:
-            final_merged_data.append(group[0])
+            final_merged_data.append(_sanitize_bubble(group[0]))
             continue
 
-        # --- ROBUST ORIENTATION DETECTION (THE FIX) ---
-        # Determine group orientation by a "majority vote" of the lines inside it.
-        vertical_lines_count = sum(1 for line in group if line["tightBoundingBox"]['height'] > line["tightBoundingBox"]['width'])
-        horizontal_lines_count = len(group) - vertical_lines_count
-        is_vertical_group = vertical_lines_count > horizontal_lines_count
+        # Step 3: Intra-group Substring & Containment Deduplication
+        sorted_by_len = sorted(group, key=lambda l: len(str(l.get("text", "")).strip()), reverse=True)
+        dropped_indices = set()
 
-        # --- STABLE SORTING LOGIC ---
+        for i in range(len(sorted_by_len)):
+            if i in dropped_indices:
+                continue
+            line_a = sorted_by_len[i]
+            text_a = re.sub(r'[\s\u200b\u3000]+', '', str(line_a.get("text", "")))
+            box_a = line_a["tightBoundingBox"]
+
+            px_a_x1, px_a_x2 = box_a["x"] * natural_width, (box_a["x"] + box_a["width"]) * natural_width
+            px_a_y1, px_a_y2 = box_a["y"] * natural_height, (box_a["y"] + box_a["height"]) * natural_height
+
+            for j in range(i + 1, len(sorted_by_len)):
+                if j in dropped_indices:
+                    continue
+                line_b = sorted_by_len[j]
+                text_b = re.sub(r'[\s\u200b\u3000]+', '', str(line_b.get("text", "")))
+                box_b = line_b["tightBoundingBox"]
+
+                px_b_x1, px_b_x2 = box_b["x"] * natural_width, (box_b["x"] + box_b["width"]) * natural_width
+                px_b_y1, px_b_y2 = box_b["y"] * natural_height, (box_b["y"] + box_b["height"]) * natural_height
+
+                inter_w = max(0.0, min(px_a_x2, px_b_x2) - max(px_a_x1, px_b_x1))
+                inter_h = max(0.0, min(px_a_y2, px_b_y2) - max(px_a_y1, px_b_y1))
+                inter_area = inter_w * inter_h
+                area_b = max(1.0, (px_b_x2 - px_b_x1) * (px_b_y2 - px_b_y1))
+                ios_b = inter_area / area_b
+
+                if text_b and text_a and (text_b in text_a):
+                    col_overlap = max(0.0, min(px_a_x2, px_b_x2) - max(px_a_x1, px_b_x1)) / max(1.0, min(px_a_x2 - px_a_x1, px_b_x2 - px_b_x1))
+                    row_overlap = max(0.0, min(px_a_y2, px_b_y2) - max(px_a_y1, px_b_y1)) / max(1.0, min(px_a_y2 - px_a_y1, px_b_y2 - px_b_y1))
+                    if col_overlap >= 0.35 or row_overlap >= 0.35 or ios_b >= 0.30:
+                        dropped_indices.add(j)
+                        continue
+
+                if ios_b >= 0.75:
+                    dropped_indices.add(j)
+                    continue
+
+        valid_group = [sorted_by_len[k] for k in range(len(sorted_by_len)) if k not in dropped_indices]
+        if not valid_group:
+            valid_group = group
+
+        if len(valid_group) == 1:
+            final_merged_data.append(_sanitize_bubble(valid_group[0]))
+            continue
+
+        # Step 4: Determine Group Reading Orientation
+        vertical_lines_count = sum(
+            1 for line in valid_group
+            if line.get("orientation") == 90.0 or (line["tightBoundingBox"]["height"] * natural_height >= line["tightBoundingBox"]["width"] * natural_width)
+        )
+        is_vertical_group = vertical_lines_count >= (len(valid_group) - vertical_lines_count)
+
+        # Step 5: Sub-line clustering & 2D Reading Order Sorting
+        uf_sort = UnionFind(len(valid_group))
+        for i in range(len(valid_group)):
+            for j in range(i + 1, len(valid_group)):
+                box_a = valid_group[i]["tightBoundingBox"]
+                box_b = valid_group[j]["tightBoundingBox"]
+
+                px_a_x, px_a_w = box_a["x"] * natural_width, box_a["width"] * natural_width
+                px_a_y, px_a_h = box_a["y"] * natural_height, box_a["height"] * natural_height
+                px_b_x, px_b_w = box_b["x"] * natural_width, box_b["width"] * natural_width
+                px_b_y, px_b_h = box_b["y"] * natural_height, box_b["height"] * natural_height
+
+                if is_vertical_group:
+                    overlap = max(0.0, min(px_a_x + px_a_w, px_b_x + px_b_w) - max(px_a_x, px_b_x))
+                    min_size = min(px_a_w, px_b_w)
+                else:
+                    overlap = max(0.0, min(px_a_y + px_a_h, px_b_y + px_b_h) - max(px_a_y, px_b_y))
+                    min_size = min(px_a_h, px_b_h)
+
+                if min_size > 0 and (overlap / min_size) > 0.40:
+                    uf_sort.union(i, j)
+
+        sub_lines_dict = defaultdict(list)
+        for i in range(len(valid_group)):
+            root = uf_sort.find(i)
+            sub_lines_dict[root].append(valid_group[i])
+
+        sub_lines = list(sub_lines_dict.values())
+
+        # Sort elements within each column/row along primary axis
+        for sub in sub_lines:
+            if is_vertical_group:
+                sub.sort(key=lambda line: line["tightBoundingBox"]["y"])
+            else:
+                sub.sort(key=lambda line: line["tightBoundingBox"]["x"])
+
+        # Sort sub-lines along secondary axis (Vertical: R-to-L; Horizontal: T-to-B)
         if is_vertical_group:
-            # Sort by the horizontal center of the box (descending for right-to-left)
-            # then by the vertical center (ascending for top-to-bottom).
-            group.sort(key=lambda line: (
-                -(line["tightBoundingBox"]["x"] + line["tightBoundingBox"]["width"] / 2), 
-                line["tightBoundingBox"]["y"] + line["tightBoundingBox"]["height"] / 2
-            ))
+            sub_lines.sort(key=lambda sub: -sum(line["tightBoundingBox"]["x"] + line["tightBoundingBox"]["width"] / 2.0 for line in sub) / len(sub))
         else:
-            # Sort by the vertical center, then by the horizontal center.
-            group.sort(key=lambda line: (
-                line["tightBoundingBox"]["y"] + line["tightBoundingBox"]["height"] / 2, 
-                line["tightBoundingBox"]["x"] + line["tightBoundingBox"]["width"] / 2
-            ))
-        
-        join_char = " " if config["add_space_on_merge"] else "\u200b"
-        combined_text = join_char.join([line["text"] for line in group])
+            sub_lines.sort(key=lambda sub: sum(line["tightBoundingBox"]["y"] + line["tightBoundingBox"]["height"] / 2.0 for line in sub) / len(sub))
 
-        # Calculate final bounding box for the merged group
-        group_bboxes = [line["tightBoundingBox"] for line in group]
-        min_x = min(b["x"] for b in group_bboxes)
-        min_y = min(b["y"] for b in group_bboxes)
-        max_r = max(b["x"] + b["width"] for b in group_bboxes)
-        max_b = max(b["y"] + b["height"] for b in group_bboxes)
+        sorted_group = []
+        for sub in sub_lines:
+            sorted_group.extend(sub)
+
+        join_char = " " if config["add_space_on_merge"] else "\u200b"
+        combined_text = join_char.join([str(line["text"]).strip() for line in sorted_group if str(line.get("text", "")).strip()])
+
+        group_bboxes = [line["tightBoundingBox"] for line in sorted_group]
+        min_x = min(float(b["x"]) for b in group_bboxes)
+        min_y = min(float(b["y"]) for b in group_bboxes)
+        max_r = max(float(b["x"] + b["width"]) for b in group_bboxes)
+        max_b = max(float(b["y"] + b["height"]) for b in group_bboxes)
 
         final_merged_data.append({
-            "text": combined_text,
+            "text": str(combined_text),
             "isMerged": True,
             "forcedOrientation": "vertical" if is_vertical_group else "horizontal",
+            "orientation": 90.0 if is_vertical_group else 0.0,
             "tightBoundingBox": {
-                "x": min_x,
-                "y": min_y,
-                "width": max_r - min_x,
-                "height": max_b - min_y,
+                "x": float(min_x),
+                "y": float(min_y),
+                "width": float(max_r - min_x),
+                "height": float(max_b - min_y),
             },
         })
 
-    if len(final_merged_data) < len(lines):
-        print(f"[AutoMerge] Finished. Initial lines: {len(lines)}, Final merged lines: {len(final_merged_data)}")
-
-    return final_merged_data
-
-# endregion
+    # Step 6: Post-Merge Deduplication & Cross-Orientation Conflict Resolution
+    return _resolve_merged_bubble_conflicts(final_merged_data, natural_width, natural_height)
 
 
-# region Utility
-
-
+# ==============================================================================
+# 5. Cache Utilities & Background Job Runner
+# ==============================================================================
 def load_cache():
     global ocr_cache
     if os.path.exists(CACHE_FILE_PATH):
@@ -304,13 +718,7 @@ def save_cache():
         print("[DEBUG] OCR cache saved successfully.")
 
 
-# endregion
-
-
-# region Background Job
-
-
-def run_chapter_processing_job(base_url, auth_user, auth_pass, context):
+def run_chapter_processing_job(base_url: str, auth_user: str, auth_pass: str, context: str):
     global active_job_count
     with active_job_lock:
         active_job_count += 1
@@ -319,7 +727,7 @@ def run_chapter_processing_job(base_url, auth_user, auth_pass, context):
 
     page_index, consecutive_errors = 0, 0
     CONSECUTIVE_ERROR_THRESHOLD = 3
-    SERVER_URL_BASE = "http://127.0.0.1:3000"
+    SERVER_URL_BASE = f"http://127.0.0.1:{PORT}"
 
     while consecutive_errors < CONSECUTIVE_ERROR_THRESHOLD:
         image_url = f"{base_url}{page_index}"
@@ -332,7 +740,7 @@ def run_chapter_processing_job(base_url, auth_user, auth_pass, context):
 
         encoded_url = quote(image_url, safe="")
         encoded_context = quote(context, safe="")
-        target_url = (f"{SERVER_URL_BASE}/ocr?url={encoded_url}&context={encoded_context}")
+        target_url = f"{SERVER_URL_BASE}/ocr?url={encoded_url}&context={encoded_context}"
         if auth_user:
             target_url += f"&user={auth_user}&pass={auth_pass}"
 
@@ -343,9 +751,9 @@ def run_chapter_processing_job(base_url, auth_user, auth_pass, context):
                 consecutive_errors = 0
             else:
                 consecutive_errors += 1
-                print(f"[JobRunner] [{context}] Got non-200 status ({response.status_code}) for {image_url}. Errors: {consecutive_errors}")
+                print(f"[JobRunner] [{context}] Got status {response.status_code} for {image_url}. Errors: {consecutive_errors}")
                 if response.status_code == 404:
-                    print("[JobRunner] (Page not found, likely end of chapter)")
+                    print("[JobRunner] (Page not found, end of chapter reached)")
         except requests.exceptions.RequestException as e:
             consecutive_errors += 1
             print(f"[JobRunner] [{context}] Request failed for {image_url}. Errors: {consecutive_errors}. Details: {e}")
@@ -353,16 +761,14 @@ def run_chapter_processing_job(base_url, auth_user, auth_pass, context):
         page_index += 1
         time.sleep(0.1)
 
-    print(f"[JobRunner] [{context}] Finished job for ...{base_url[-40:]}. Reached {consecutive_errors} errors.")
+    print(f"[JobRunner] [{context}] Finished job for ...{base_url[-40:]}. Reached {consecutive_errors} error(s).")
     with active_job_lock:
         active_job_count -= 1
 
 
-# endregion
-
-# region Endpoints
-
-
+# ==============================================================================
+# 6. HTTP Endpoints
+# ==============================================================================
 @app.route("/")
 def status_endpoint():
     with cache_lock:
@@ -407,49 +813,16 @@ async def ocr_endpoint():
 
         pil_image = Image.open(io.BytesIO(image_bytes))
         rgb_image = pil_image.convert("RGB")
-        
         full_width, full_height = rgb_image.size
-        all_final_results = []
-        MAX_CHUNK_HEIGHT = 3000
 
-        if full_height > MAX_CHUNK_HEIGHT:
-            print(f"[OCR] [{context}] Image is tall ({full_height}px). Processing in chunks.")
-            y_offset = 0
-            while y_offset < full_height:
-                box = (0, y_offset, full_width, min(y_offset + MAX_CHUNK_HEIGHT, full_height))
-                chunk_image = rgb_image.crop(box)
-                chunk_width, chunk_height = chunk_image.size
-                print(f"[OCR] [{context}] Processing chunk at y={y_offset} (size: {chunk_width}x{chunk_height})")
+        raw_results = await ocr_engine.ocr(rgb_image)
+        all_final_results = raw_results
 
-                raw_chunk_results = await ocr_engine.ocr(chunk_image)
-                
-                merged_chunk_results = raw_chunk_results
-                if AUTO_MERGE_CONFIG["enabled"] and raw_chunk_results:
-                    merged_chunk_results = auto_merge_ocr_data(raw_chunk_results, chunk_width, chunk_height, AUTO_MERGE_CONFIG)
+        if AUTO_MERGE_CONFIG["enabled"] and raw_results:
+            all_final_results = auto_merge_ocr_data(raw_results, full_width, full_height, AUTO_MERGE_CONFIG)
+        elif raw_results:
+            all_final_results = [_sanitize_bubble(b) for b in _deduplicate_raw_lines(raw_results, full_width, full_height)]
 
-                for result in merged_chunk_results:
-                    bbox = result['tightBoundingBox']
-                    x_local_px = bbox['x'] * chunk_width
-                    y_local_px = bbox['y'] * chunk_height
-                    width_px = bbox['width'] * chunk_width
-                    height_px = bbox['height'] * chunk_height
-
-                    y_global_px = y_local_px + y_offset
-                    result['tightBoundingBox'] = {
-                        'x': x_local_px / full_width,
-                        'y': y_global_px / full_height,
-                        'width': width_px / full_width,
-                        'height': height_px / full_height
-                    }
-                    all_final_results.append(result)
-                
-                y_offset += MAX_CHUNK_HEIGHT
-        else:
-            raw_results = await ocr_engine.ocr(rgb_image)
-            all_final_results = raw_results
-            if AUTO_MERGE_CONFIG["enabled"] and raw_results:
-                all_final_results = auto_merge_ocr_data(raw_results, full_width, full_height, AUTO_MERGE_CONFIG)
-        
         with cache_lock:
             ocr_cache[image_url] = {"context": context, "data": all_final_results}
             ocr_requests_processed += 1
@@ -531,7 +904,7 @@ def import_cache_endpoint():
                     elif isinstance(value, dict) and "data" in value:
                         ocr_cache[key] = value
                     else:
-                        continue 
+                        continue
                     new_items += 1
             if new_items > 0:
                 save_cache()
@@ -543,77 +916,71 @@ def import_cache_endpoint():
     except Exception as e:
         return jsonify({"error": f"Import failed: {e}"}), 500
 
+
 @app.route("/update-cache", methods=["POST"])
 def update_cache_endpoint():
-    """
-    Updates a specific cache entry with modified OCR data.
-    Expected JSON: { "url": "image_url", "data": [...ocr_results...], "context": "optional context" }
-    """
     try:
         request_data = request.json
         if not request_data:
             return jsonify({"error": "Invalid JSON payload"}), 400
-        
+
         image_url = request_data.get("url")
         new_data = request_data.get("data")
         context = request_data.get("context", "Updated from client")
-        
+
         if not image_url:
             return jsonify({"error": "URL is required"}), 400
-        
+
         if not isinstance(new_data, list):
             return jsonify({"error": "Data must be an array of OCR results"}), 400
-        
+
         with cache_lock:
-            # Update the cache entry
             ocr_cache[image_url] = {
                 "context": context,
                 "data": new_data
             }
             save_cache()
-            
             print(f"[Cache] Updated entry for: {image_url[-50:]}")
-        
+
         return jsonify({
             "status": "success",
             "message": f"Cache updated for {image_url}",
             "data_length": len(new_data)
         })
-    
+
     except Exception as e:
         print(f"[Cache] Update failed: {e}")
         if is_debug_mode:
             traceback.print_exc()
         return jsonify({"error": f"Update failed: {e}"}), 500
 
-# endregion
 
-# region Main
-
-
+# ==============================================================================
+# 7. Entry Point
+# ==============================================================================
 def main():
     global ocr_engine, is_debug_mode
     parser = argparse.ArgumentParser(description="Run the Python OCR Server.")
     parser.add_argument("-d", "--debug", action="store_true", help="enable debug mode")
-    parser.add_argument("-e", "--engine", type=str, default="lens", help="OCR engine to use: 'lens', 'oneocr'")
+    parser.add_argument("-e", "--engine", type=str, default="lens", help="OCR engine: 'lens', 'oneocr', 'mangaocr', 'mangaocrdirectml', 'ppocrv6manga'")
     args = parser.parse_args()
     is_debug_mode = args.debug
 
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     os.makedirs(IMAGE_CACHE_FOLDER, exist_ok=True)
 
-    print(f"[Engine] Initializing {args.engine}...")
+    print(f"[Engine] Initializing '{args.engine}'...")
     try:
         ocr_engine = initialize_engine(args.engine)
-        print(f"[Engine] {args.engine} initialization complete.")
+        print(f"[Engine] '{args.engine}' initialized successfully.")
     except Exception as e:
-        print(f"[Engine] Failed to initialize {args.engine}: {e}")
+        print(f"[Engine] Failed to initialize '{args.engine}': {e}")
         raise SystemExit(1)
 
     load_cache()
 
     if is_debug_mode:
-        print("--- Starting Flask Development Server in DEBUG MODE ---")
+        print("--- Starting Flask Server in DEBUG MODE ---")
         app.run(host=IP_ADDRESS, port=PORT, debug=True, use_reloader=False)
     else:
         print("--- Starting Waitress Production Server ---")
@@ -623,5 +990,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# endregion
