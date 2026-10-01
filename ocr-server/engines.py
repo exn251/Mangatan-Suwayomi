@@ -5,17 +5,16 @@
 # ==============================================================================
 from abc import ABC, abstractmethod
 import asyncio
+import gc
 import io
-import json
 import math
 import os
 import random
 import re
 import shutil
-import sys
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypedDict, Union
+from typing import Callable, Optional, TypedDict
 import urllib.request
 
 # ==============================================================================
@@ -23,7 +22,7 @@ import urllib.request
 # ==============================================================================
 import cv2
 import numpy as np
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image
 import pyclipper
 from shapely.geometry import Polygon
 
@@ -431,230 +430,6 @@ class GoogleLens(Engine):
                 output_json.append(bubble)
 
         return output_json
-
-class MangaOCR(Engine):
-    """
-    OCR engine that uses Meiki text detection on CPU to find text boxes,
-    then runs default Manga OCR on batched detected regions.
-    """
-    
-    def __init__(
-        self, 
-        model_path: str = "meiki.text.detect.v0.1.960x544.onnx",
-        confidence_threshold: float = 0.4,
-        force_cpu: bool = True
-    ):
-        self.detect_width = 960
-        self.detect_height = 544
-        self.BATCH_SIZE = 2 
-        self.confidence_threshold = confidence_threshold
-        
-        # Concurrency limit to prevent CPU core/thread saturation from parallel requests
-        self._ocr_semaphore = threading.Semaphore(1) 
-
-        # Resolve clean base folders
-        try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-        except NameError:
-            script_dir = os.getcwd()
-            
-        models_dir = os.path.join(script_dir, "models")
-        os.makedirs(models_dir, exist_ok=True)
-
-        # 1. Resolve and download Meiki model
-        try:
-            if os.path.exists(model_path):
-                resolved_path = model_path
-            else:
-                filename = os.path.basename(model_path)
-                print(f"[MeikiMangaOCR] Resolving '{filename}' via Hugging Face...")
-                
-                resolved_path = hf_hub_download(
-                    repo_id="rtr46/meiki.text.detect.v0",
-                    filename=filename,
-                    local_dir=models_dir 
-                )
-            detect_sess_options = ort.SessionOptions()
-            detect_sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            
-            self.detection_session = ort.InferenceSession(
-                resolved_path, 
-                sess_options=detect_sess_options,
-                providers=['CPUExecutionProvider']
-            )
-            print(f"[MeikiMangaOCR] Loaded CPU text detection model: {resolved_path}")
-        except Exception as e:
-            print(f"[Error] Failed to load Meiki text detection model: {e}")
-            raise
-        
-        # 2. Initialize default manga-ocr
-        try:
-            from manga_ocr import MangaOcr as MOCR
-            import logging
-            from loguru import logger
-            
-            logger.disable('manga_ocr')
-            logging.getLogger('transformers').setLevel(logging.ERROR)
-            
-            # Loads the default model ('kha-white/manga-ocr-base')
-            self.manga_ocr = MOCR(force_cpu=force_cpu)
-            print(f"[MeikiMangaOCR] Loaded default Manga OCR model "
-                  f"(Device: {'CPU' if force_cpu else 'GPU'}, Batch Size: {self.BATCH_SIZE})")
-                  
-        except ImportError as e:
-            print(f"[Error] manga-ocr not installed: {e}")
-            raise
-        except Exception as e:
-            print(f"[Error] Failed to initialize Manga OCR: {e}")
-            raise
-
-    def _apply_gamma(self, image: np.ndarray, gamma: float) -> np.ndarray:
-        if gamma == 1.0:
-            return image
-        inv_gamma = 1.0 / gamma
-        table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
-        return cv2.LUT(image, table)
-
-    def _resize(self, image: np.ndarray, w: int, h: int):
-        return cv2.resize(image, (w, h), interpolation=cv2.INTER_LINEAR)
-
-    def _detect_text_boxes(self, image: np.ndarray):
-        img_height, img_width = image.shape[:2]
-        
-        # Sweep Winner Optimization: Gamma 1.5 washes out screentone noise before detection
-        processed_img = self._apply_gamma(image, 1.5)
-        
-        # Sweep Winner Optimization: STRETCH mode + LINEAR interpolation
-        resized_image = self._resize(processed_img, self.detect_width, self.detect_height)
-        
-        img_normalized = resized_image.astype(np.float32) / 255.0
-        img_transposed = np.transpose(img_normalized, (2, 0, 1))
-        image_input_tensor = np.expand_dims(img_transposed, axis=0)
-        
-        size_tensor = np.array([[img_width, img_height]], dtype=np.int64)
-        
-        input_names = [inp.name for inp in self.detection_session.get_inputs()]
-        inputs = {
-            input_names[0]: image_input_tensor,
-            input_names[1]: size_tensor
-        }
-        
-        outputs = self.detection_session.run(None, inputs)
-        _, boxes, scores = outputs 
-        
-        boxes = boxes[0]
-        scores = scores[0]
-        
-        original_boxes = []
-        for box, score in zip(boxes, scores):
-            if score > self.confidence_threshold:
-                x_min, y_min, x_max, y_max = box
-                
-                final_x_min = int(x_min)
-                final_y_min = int(y_min)
-                final_x_max = int(x_max)
-                final_y_max = int(y_max)
-                
-                # Sweep Winner Optimization: DYNPADON
-                # Calculates 2.5% of box height to provide intelligent top/bottom headroom 
-                box_height = final_y_max - final_y_min
-                top_pad = max(3, min(6, int(box_height * 0.025)))
-                bottom_pad = max(3, min(6, int(box_height * 0.025)))
-                
-                final_y_min = max(0, final_y_min - top_pad)
-                final_y_max = min(img_height, final_y_max + bottom_pad)
-                
-                final_x_min = max(0, final_x_min + 0)
-                final_x_max = min(img_width, final_x_max + 4)
-                
-                if final_x_min < final_x_max and final_y_min < final_y_max:
-                    original_boxes.append((final_x_min, final_y_min, final_x_max, final_y_max))
-        
-        return original_boxes
-
-    async def ocr(self, img: Image) -> list[Bubble]:
-        return await asyncio.to_thread(self._ocr_internal, img)
-
-    def _ocr_internal(self, img: Image) -> list[Bubble]:
-        img_array = np.array(img)
-        original_width, original_height = img.size
-        
-        boxes = self._detect_text_boxes(img_array)
-        
-        if not boxes:
-            print("[MeikiMangaOCR] No text boxes detected")
-            return []
-            
-        print(f"[MeikiMangaOCR] Detected {len(boxes)} text boxes")
-        
-        crop_data = []
-        for x1, y1, x2, y2 in boxes:
-            # Sweep Winner Optimization: OCR0 (No extra white padding yields the highest text clarity)
-            crop = img.crop((x1, y1, x2, y2))
-            if crop.width >= 10 and crop.height >= 10:
-                crop = crop.convert("L").convert("RGB")
-                crop_data.append((crop, (x1, y1, x2, y2)))
-        
-        if not crop_data:
-            return []
-
-        bubbles = []
-        device = self.manga_ocr.model.device
-        
-        for i in range(0, len(crop_data), self.BATCH_SIZE):
-            batch_chunk = crop_data[i : i + self.BATCH_SIZE]
-            batch_images = [item[0] for item in batch_chunk]
-            batch_boxes = [item[1] for item in batch_chunk]
-            
-            try:
-                # 1. Preprocess images using the standard Image Processor
-                pixel_values = self.manga_ocr.processor(
-                    batch_images, 
-                    return_tensors="pt"
-                ).pixel_values.to(device)
-                
-                # 2. Concurrency limit & 40 token constraint
-                with self._ocr_semaphore:
-                    generated_ids = self.manga_ocr.model.generate(
-                        pixel_values,
-                        max_new_tokens=40,
-                        num_beams=1,
-                    )
-                
-                # 3. Decode tokens using the tokenizer
-                batch_texts = self.manga_ocr.tokenizer.batch_decode(
-                    generated_ids, 
-                    skip_special_tokens=True
-                )
-                
-                for text, (x1, y1, x2, y2) in zip(batch_texts, batch_boxes):
-                    text = re.sub(r'\s+', '', text)
-                    if not text:
-                        continue
-                        
-                    width = x2 - x1
-                    height = y2 - y1
-                    
-                    bubbles.append(Bubble(
-                        text=text,
-                        tightBoundingBox=BoundingBox(
-                            x=x1 / original_width,
-                            y=y1 / original_height,
-                            width=width / original_width,
-                            height=height / original_height,
-                        ),
-                        orientation=90.0 if height > width else 0.0,
-                        font_size=0.04,
-                        confidence=0.95, 
-                    ))
-                    
-            except Exception as e:
-                print(f"[Warning] Batch OCR failed for batch starting at {i}: {e}")
-                continue
-                
-        print(f"[MeikiMangaOCR] Successfully processed {len(bubbles)} text regions")
-        return bubbles
-
   
 class MangaOCR(Engine):
     """
@@ -2123,8 +1898,6 @@ def initialize_engine(engine_name: str) -> Engine:
 
     if engine_name in ("lens", "googlelens"):
         return GoogleLens()
-    elif engine_name == "oneocr":
-        return OneOCR()
     elif engine_name == "mangaocrdirectml":
         return MangaOCRDirectML()
     elif engine_name == "ppocrv6manga":
