@@ -2,6 +2,9 @@
 
 Mangatan is a language-learning tool that creates Yomitan-scannable text overlays directly on top of manga served by **Suwayomi**.
 
+> ### ⚠️ Important Notice for Updates
+> If you are updating from an earlier version or encounter unexpected issues, please **re-clone the repository fresh** (`git clone`) rather than pulling or manually copying files over. This ensures all server backends, package configurations, and userscript assets remain cleanly synchronized.
+
 > ### 💡 Looking for a Simpler Setup?
 > For a streamlined application for reading and mining manga, anime, and novels on multiple platforms, check out: **[Manatan](https://github.com/KolbyML/Manatan)** or [Mangatan (Mangayomi fork)](https://github.com/1Selxo/Mangatan)
 
@@ -277,9 +280,7 @@ You can use **NSSM** (Non-Sucking Service Manager) to run both utilities in the 
   cd /d "<path-to-mangatan-ocr-server-folder>"
   uv run server.py -e=ppocrv6manga --ip <your-ip-address> --port <your-port>
   ```
-
 ---
 
 ## 💾 Caching & Cache Management
 * The OCR server automatically creates and writes to `ocr-cache.json` in its root folder to store OCR results and manual box edits across reader sessions.
-```
