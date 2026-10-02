@@ -634,14 +634,29 @@ def auto_merge_ocr_data(lines: list[dict], natural_width: int, natural_height: i
                 px_b_y, px_b_h = box_b["y"] * natural_height, box_b["height"] * natural_height
 
                 if is_vertical_group:
-                    overlap = max(0.0, min(px_a_x + px_a_w, px_b_x + px_b_w) - max(px_a_x, px_b_x))
-                    min_size = min(px_a_w, px_b_w)
-                else:
-                    overlap = max(0.0, min(px_a_y + px_a_h, px_b_y + px_b_h) - max(px_a_y, px_b_y))
-                    min_size = min(px_a_h, px_b_h)
+                    # Overlap along the X axis (column alignment)
+                    overlap_x = max(0.0, min(px_a_x + px_a_w, px_b_x + px_b_w) - max(px_a_x, px_b_x))
+                    min_w = min(px_a_w, px_b_w)
 
-                if min_size > 0 and (overlap / min_size) > 0.40:
-                    uf_sort.union(i, j)
+                    # Overlap along the Y axis (parallel check)
+                    overlap_y = max(0.0, min(px_a_y + px_a_h, px_b_y + px_b_h) - max(px_a_y, px_b_y))
+                    min_h = min(px_a_h, px_b_h)
+
+                    # Lines in the same vertical column must align in X and NOT overlap parallelly in Y
+                    is_parallel = (min_h > 0) and (overlap_y / min_h > 0.25)
+                    if min_w > 0 and (overlap_x / min_w > 0.45) and not is_parallel:
+                        uf_sort.union(i, j)
+                else:
+                    # Overlap along the Y axis (row alignment)
+                    overlap_y = max(0.0, min(px_a_y + px_a_h, px_b_y + px_b_h) - max(px_a_y, px_b_y))
+                    min_h = min(px_a_h, px_b_h)
+
+                    overlap_x = max(0.0, min(px_a_x + px_a_w, px_b_x + px_b_w) - max(px_a_x, px_b_x))
+                    min_w = min(px_a_w, px_b_w)
+
+                    is_parallel = (min_w > 0) and (overlap_x / min_w > 0.25)
+                    if min_h > 0 and (overlap_y / min_h > 0.45) and not is_parallel:
+                        uf_sort.union(i, j)
 
         sub_lines_dict = defaultdict(list)
         for i in range(len(valid_group)):
