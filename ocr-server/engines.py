@@ -1144,23 +1144,23 @@ class MangaOCRDirectML(Engine):
 
         return await self._process_webtoon_chunked(img, self._ocr_single_chunk, "MangaOCRDirectML")
 
-
 class PPOCRv6Manga(Engine):
     """
     All-in-One Japanese Manga & Webtoon OCR Engine:
-    - Detector: DBNet Manga Detector v0.2 FP16 (DirectML GPU / CPU fallback)
-    - Recognizer: PP-OCRv6 Manga v0.2 fine-tune (DirectML GPU / CPU fallback)
-    - Full Page Presets: thresh=0.15, box_thresh=0.25, unclip_ratio=1.4
+    - Detector: DBNet Manga Detector v0.2 FP16 (DirectML default -> CPU fallback)
+    - Recognizer: PP-OCRv6 Manga v0.2 (DirectML default -> CPU fallback)
+    - Preprocessing & Furigana Trim: 1:1 with HF Space (BGR, dynamic width, 2-stage trim)
     - Reading Order v2: Block-aware speech balloon union-find clustering
-    - DirectML Batching & Standby auto-unloading
-    - Lens-style webtoon chunking
+    - False-positive droplet & noise filter: Restored DROPLET_CHARS
+    - Auto-unloading maintenance thread
     """
 
     HF_REPO_ID = "Kellenok/PP-OCRv6_manga"
+    
     DROPLET_CHARS: set[str] = {
         "し", "つ", "ひ", "く", "ノ", "と", "つっ", "へ", "S", "s", "2", "1", "c", "C", "I", "l", "ー", "〜", "・", "、", "…", ".."
     }
-    REJECT_PATTERNS: set[str] = {"..", "...", "……"}
+    REJECT_PATTERNS: set[str] = {"..", "...", "……", "o。"}
 
     def __init__(
         self,
@@ -1168,8 +1168,7 @@ class PPOCRv6Manga(Engine):
         box_thresh: float = 0.25,
         unclip_ratio: float = 1.4,
         filter_furigana: bool = False,
-        rec_confidence_threshold: float = 0.35,
-        batch_size: int = 32,
+        rec_version: str = "v0.2",
         timeout_seconds: int = 600
     ):
         super().__init__()
@@ -1177,8 +1176,7 @@ class PPOCRv6Manga(Engine):
         self.box_thresh = box_thresh
         self.unclip_ratio = unclip_ratio
         self.filter_furigana = filter_furigana
-        self.rec_confidence_threshold = rec_confidence_threshold
-        self.batch_size = batch_size
+        self.rec_version = rec_version if rec_version in ("v0.1", "v0.2") else "v0.2"
         self.timeout_seconds = timeout_seconds
 
         self.CHUNK_HEIGHT = 2500
@@ -1193,7 +1191,6 @@ class PPOCRv6Manga(Engine):
         self.sess_rec = None
         self.det_is_fp16 = False
         self.rec_is_fp16 = False
-        self.can_batch_rec = False
 
         try:
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1214,6 +1211,7 @@ class PPOCRv6Manga(Engine):
         candidates = [
             os.path.join(self.models_dir, subpath),
             os.path.join(self.models_dir, os.path.basename(subpath)),
+            os.path.join(os.getcwd(), subpath),
         ]
         for c in candidates:
             if os.path.exists(c):
@@ -1232,29 +1230,27 @@ class PPOCRv6Manga(Engine):
                 url = "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/main/ppocr/utils/dict/ppocrv6_dict.txt"
                 urllib.request.urlretrieve(url, dict_path)
 
-        self.dict_chars = ["blank"]
-        if os.path.exists(dict_path):
-            with open(dict_path, encoding="utf-8") as f:
-                for line in f:
-                    self.dict_chars.append(line.rstrip("\r\n"))
-        self.dict_chars.append(" ")
+        with open(dict_path, encoding="utf-8") as f:
+            self.dict_chars = ["blank"] + [line.strip("\r\n") for line in f] + [" "]
 
     def _verify_and_download_model_files(self):
+        # Detector is fine in FP16 (fast, coarse heatmap)
         try:
             self.det_path = self._resolve_or_download("det/manga_det_v0.2_fp16.onnx")
         except Exception:
             self.det_path = self._resolve_or_download("det/manga_det_v0.2.onnx")
 
+        # Recognizer prefers FP32 for DirectML precision
         try:
-            self.rec_path = self._resolve_or_download("rec/manga_rec_v0.2_fp16.onnx")
+            self.rec_path = self._resolve_or_download(f"rec/manga_rec_{self.rec_version}.onnx")
         except Exception:
-            self.rec_path = self._resolve_or_download("rec/manga_rec_v0.2.onnx")
+            self.rec_path = self._resolve_or_download(f"rec/manga_rec_{self.rec_version}_fp16.onnx")
 
     def _load_models(self):
         if self.models_loaded:
             return
 
-        print("[PPOCRv6Manga] Initializing v0.2 models on DirectML GPU / CPU...", flush=True)
+        print(f"[PPOCRv6Manga] Initializing models ({self.rec_version}) on DirectML GPU / CPU fallback...", flush=True)
         try:
             available = ort.get_available_providers()
             use_dml = 'DmlExecutionProvider' in available
@@ -1265,6 +1261,7 @@ class PPOCRv6Manga(Engine):
             sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             sess_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
+            # Detector Session
             try:
                 self.sess_det = ort.InferenceSession(self.det_path, sess_options=sess_opts, providers=providers)
             except Exception as e:
@@ -1273,6 +1270,7 @@ class PPOCRv6Manga(Engine):
 
             self.det_is_fp16 = "float16" in self.sess_det.get_inputs()[0].type
 
+            # Recognizer Session
             try:
                 self.sess_rec = ort.InferenceSession(self.rec_path, sess_options=sess_opts, providers=providers)
             except Exception as e:
@@ -1282,8 +1280,6 @@ class PPOCRv6Manga(Engine):
                 self.sess_rec = ort.InferenceSession(self.rec_path, sess_options=cpu_opts, providers=['CPUExecutionProvider'])
 
             self.rec_is_fp16 = "float16" in self.sess_rec.get_inputs()[0].type
-            rec_in_shape = self.sess_rec.get_inputs()[0].shape
-            self.can_batch_rec = (isinstance(rec_in_shape[0], str) or rec_in_shape[0] is None or rec_in_shape[0] == -1)
 
             self.models_loaded = True
             self.last_access_time = time.time()
@@ -1296,7 +1292,7 @@ class PPOCRv6Manga(Engine):
     def _unload_models(self):
         if not self.models_loaded:
             return
-        print(f"[PPOCRv6Manga] Standby timeout ({self.timeout_seconds}s) reached. Unloading models.")
+        print(f"[PPOCRv6Manga] Standby timeout reached ({self.timeout_seconds}s). Unloading models.")
         self.sess_det = None
         self.sess_rec = None
         self.models_loaded = False
@@ -1308,6 +1304,20 @@ class PPOCRv6Manga(Engine):
             with self._lock:
                 if self.models_loaded and (time.time() - self.last_access_time > self.timeout_seconds):
                     self._unload_models()
+
+    def _run_det(self, inp_tensor: np.ndarray) -> np.ndarray:
+        inp_name = self.sess_det.get_inputs()[0].name
+        inp_dtype = np.float16 if self.det_is_fp16 else np.float32
+        with self._gpu_semaphore:
+            out = self.sess_det.run(None, {inp_name: inp_tensor.astype(inp_dtype)})[0]
+        return out[0, 0].astype(np.float32)
+
+    def _run_rec(self, c_inp: np.ndarray) -> np.ndarray:
+        rec_inp_name = self.sess_rec.get_inputs()[0].name
+        rec_dtype = np.float16 if self.rec_is_fp16 else np.float32
+        with self._gpu_semaphore:
+            out = self.sess_rec.run(None, {rec_inp_name: c_inp.astype(rec_dtype)})[0]
+        return out[0].astype(np.float32)
 
     @staticmethod
     def _unclip_pp(box: np.ndarray, ratio: float = 1.4) -> Optional[np.ndarray]:
@@ -1393,16 +1403,20 @@ class PPOCRv6Manga(Engine):
             if box_sub['cx'] <= box_main['cx']:
                 return False
             oy = max(0.0, min(box_sub['ymax'], box_main['ymax']) - max(box_sub['ymin'], box_main['ymin']))
-            if (oy / max(0.001, min(sub_h, main_h))) < overlap_ratio:
+            y_overlap_ratio = oy / max(0.001, min(sub_h, main_h))
+            if y_overlap_ratio < overlap_ratio:
                 return False
-            return max(0.0, box_sub['xmin'] - box_main['xmax']) <= proximity_limit
+            x_gap = max(0.0, box_sub['xmin'] - box_main['xmax'])
+            return x_gap <= proximity_limit
         else:
             if box_sub['cy'] >= box_main['cy']:
                 return False
             ox = max(0.0, min(box_sub['xmax'], box_main['xmax']) - max(box_sub['xmin'], box_main['xmin']))
-            if (ox / max(0.001, min(sub_w, main_w))) < overlap_ratio:
+            x_overlap_ratio = ox / max(0.001, min(sub_w, main_w))
+            if x_overlap_ratio < overlap_ratio:
                 return False
-            return max(0.0, box_main['ymin'] - box_sub['ymax']) <= proximity_limit
+            y_gap = max(0.0, box_main['ymin'] - box_sub['ymax'])
+            return y_gap <= proximity_limit
 
     @staticmethod
     def _get_rotate_crop_image(img: np.ndarray, points: list) -> tuple[np.ndarray, np.ndarray]:
@@ -1416,8 +1430,12 @@ class PPOCRv6Manga(Engine):
         rect[3] = points[np.argmax(diff)]
         (tl, tr, br, bl) = rect
 
-        maxWidth = max(int(np.hypot(br[0] - bl[0], br[1] - bl[1])), int(np.hypot(tr[0] - tl[0], tr[1] - tl[1])))
-        maxHeight = max(int(np.hypot(tr[0] - br[0], tr[1] - br[1])), int(np.hypot(tl[0] - bl[0], tr[1] - bl[1])))
+        widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+        widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+        maxWidth = max(int(widthA), int(widthB))
+        heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+        heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+        maxHeight = max(int(heightA), int(heightB))
 
         if maxWidth <= 0 or maxHeight <= 0:
             return np.zeros((10, 10, 3), dtype=np.uint8), points
@@ -1428,11 +1446,12 @@ class PPOCRv6Manga(Engine):
 
         new_points = points
         if maxHeight > maxWidth and (maxWidth / float(maxHeight)) >= 0.25 and maxWidth >= 24:
-            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY) if warped.ndim == 3 else warped
+            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
             _, bin_img = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             proj = np.sum(bin_img, axis=0)
             x1, x2 = 0, maxWidth
 
+            # 1. Right trim (Furigana)
             r_start, r_end = int(maxWidth * 0.55), int(maxWidth * 0.90)
             zero_cols = [x for x in range(r_start, r_end) if proj[x] == 0]
             if zero_cols:
@@ -1449,6 +1468,7 @@ class PPOCRv6Manga(Engine):
                     if alongside_ratio >= 0.85 and 15 <= right_area <= 0.35 * left_area and right_rows[0] < int(maxHeight * 0.75):
                         x2 = split_r
 
+            # 2. Symmetric Left trim (Stray margin / bubble border noise)
             l_start = max(3, int(maxWidth * 0.10))
             l_end = int(maxWidth * 0.25)
             l_zeros = [x for x in range(l_start, l_end) if proj[x] == 0]
@@ -1472,6 +1492,8 @@ class PPOCRv6Manga(Engine):
                 trimmed_corners = np.array([[[x1, 0], [x2 - 1, 0], [x2 - 1, maxHeight - 1], [x1, maxHeight - 1]]], dtype=np.float32)
                 new_points = cv2.perspectiveTransform(trimmed_corners, M_inv)[0]
 
+        if warped.shape[0] > warped.shape[1]:
+            warped = cv2.rotate(warped, cv2.ROTATE_90_COUNTERCLOCKWISE)
         return warped, new_points
 
     @staticmethod
@@ -1490,6 +1512,7 @@ class PPOCRv6Manga(Engine):
         proj = np.sum(bin_img, axis=0)
         x1, x2 = 0, w
 
+        # Right trim (Furigana)
         r_start, r_end = int(w * 0.55), int(w * 0.90)
         zero_cols = [x for x in range(r_start, r_end) if proj[x] == 0]
         if zero_cols:
@@ -1506,6 +1529,7 @@ class PPOCRv6Manga(Engine):
                 if alongside_ratio >= 0.85 and 15 <= right_area <= 0.35 * left_area and right_rows[0] < int(h * 0.75):
                     x2 = split_r
 
+        # Symmetric Left trim (Stray margin / bubble border noise)
         l_start = max(3, int(w * 0.10))
         l_end = int(w * 0.25)
         l_zeros = [x for x in range(l_start, l_end) if proj[x] == 0]
@@ -1527,6 +1551,27 @@ class PPOCRv6Manga(Engine):
             c_clean = c[:, x1:x2]
             return cv2.rotate(c_clean, cv2.ROTATE_90_COUNTERCLOCKWISE) if was_horizontal else c_clean
         return crop_bgr
+
+    def _prepare_rec_input(self, crop: np.ndarray) -> Optional[np.ndarray]:
+        """Crop -> (1, 3, 48, W) float32 BGR tensor without zero-padding distortion."""
+        if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
+            return None
+        crop = self._clean_manga_vertical_crop(crop)
+        if crop.shape[0] > crop.shape[1]:
+            crop = cv2.rotate(crop, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        natural_w = int(round(48.0 * crop.shape[1] / max(1, crop.shape[0])))
+        target_w = max(16, min(2400 if natural_w > 2000 else 640, natural_w))
+        c_inp = cv2.resize(crop, (target_w, 48)).astype(np.float32) / 255.0
+        return ((c_inp - 0.5) / 0.5).transpose((2, 0, 1))[np.newaxis, ...]
+
+    def _decode_ctc(self, logits: np.ndarray) -> str:
+        indices = np.argmax(logits, axis=-1)
+        chars = []
+        for i, idx in enumerate(indices):
+            if idx != 0 and (i == 0 or idx != indices[i - 1]):
+                if idx < len(self.dict_chars):
+                    chars.append(self.dict_chars[idx])
+        return "".join(chars).strip()
 
     @staticmethod
     def _vert(b: dict) -> bool:
@@ -1635,8 +1680,7 @@ class PPOCRv6Manga(Engine):
         pH, pW = pad_img.shape[:2]
 
         target_max = max(pH, pW)
-        target_min = min(pH, pW)
-        if target_max / max(1, target_min) > 2:
+        if target_max / min(pH, pW) > 2:
             scale = min(1.0, (0.75 * 960.0 * 960.0 / (pH * pW)) ** 0.5)
         else:
             scale = 960.0 / target_max if target_max > 960 else (max(1.0, 480.0 / target_max) if target_max < 480 else 1.0)
@@ -1648,13 +1692,8 @@ class PPOCRv6Manga(Engine):
         inp = (inp - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225])
         inp_tensor = inp.transpose((2, 0, 1))[np.newaxis, ...]
 
-        inp_dtype = np.float16 if self.det_is_fp16 else np.float32
-        inp_name = self.sess_det.get_inputs()[0].name
+        pred_map = self._run_det(inp_tensor)
 
-        with self._gpu_semaphore:
-            pred_map = self.sess_det.run(None, {inp_name: inp_tensor.astype(inp_dtype)})[0][0, 0]
-
-        pred_map = pred_map.astype(np.float32)
         bitmap = pred_map > self.thresh
         contours, _ = cv2.findContours((bitmap * 255).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         raw_boxes = []
@@ -1695,101 +1734,10 @@ class PPOCRv6Manga(Engine):
                 'xmin': xmin, 'xmax': xmax, 'ymin': ymin, 'ymax': ymax,
                 'cx': (xmin + xmax) / 2.0, 'cy': (ymin + ymax) / 2.0,
                 'score': float(score),
-                'pts': box_4pts.tolist(),
-                'rect_angle': float(angle)
+                'pts': box_4pts.tolist()
             })
 
         return raw_boxes
-
-    def _recognize_lines_batched(self, crops_data: list[dict]) -> list[dict]:
-        if not crops_data:
-            return []
-
-        rec_dtype = np.float16 if self.rec_is_fp16 else np.float32
-        rec_inp_name = self.sess_rec.get_inputs()[0].name
-        results = []
-
-        batch_size = self.batch_size if self.can_batch_rec else 1
-
-        for i in range(0, len(crops_data), batch_size):
-            chunk = crops_data[i:i + batch_size]
-            max_w = max(item['target_w'] for item in chunk)
-            bucket_w = int(math.ceil(max_w / 64.0) * 64)
-
-            batch_tensor = np.zeros((len(chunk), 3, 48, bucket_w), dtype=np.float32)
-            for j, item in enumerate(chunk):
-                cw = item['target_w']
-                batch_tensor[j, :, :, :cw] = item['c_inp']
-
-            with self._gpu_semaphore:
-                logits = self.sess_rec.run(None, {rec_inp_name: batch_tensor.astype(rec_dtype)})[0]
-
-            out = logits.astype(np.float32)
-            is_logits = (np.max(out) > 1.0 or np.min(out) < 0.0)
-            if is_logits:
-                exp_out = np.exp(out - np.max(out, axis=-1, keepdims=True))
-                probs = exp_out / np.sum(exp_out, axis=-1, keepdims=True)
-            else:
-                probs = out
-
-            indices = np.argmax(probs, axis=-1)
-
-            for j, item in enumerate(chunk):
-                line_indices = indices[j]
-                line_probs = probs[j]
-
-                valid_t = min(line_indices.shape[0], max(1, int(round(item['target_w'] / 4.0))))
-                chars, confs, prev = [], [], -1
-
-                for t_step in range(valid_t):
-                    idx = int(line_indices[t_step])
-                    if idx != prev and idx != 0 and idx < len(self.dict_chars):
-                        chars.append(self.dict_chars[idx])
-                        confs.append(float(line_probs[t_step, idx]))
-                    prev = idx
-
-                text = "".join(chars).strip()
-                text = re.sub(r'\s+', '', text)
-                if not text or text in self.REJECT_PATTERNS:
-                    continue
-
-                b = item['orig_box']
-                w_box = b['xmax'] - b['xmin']
-                h_box = b['ymax'] - b['ymin']
-                area_box = w_box * h_box
-
-                if len(text) == 1 and (area_box < 400 or max(w_box, h_box) < 32 or text in self.DROPLET_CHARS or text.isascii()):
-                    continue
-
-                avg_conf = float(np.mean(confs)) if confs else 0.0
-                if avg_conf < self.rec_confidence_threshold:
-                    continue
-
-                new_pts_arr = item['new_pts_arr']
-                xmin = float(np.min(new_pts_arr[:, 0]))
-                xmax = float(np.max(new_pts_arr[:, 0]))
-                ymin = float(np.min(new_pts_arr[:, 1]))
-                ymax = float(np.max(new_pts_arr[:, 1]))
-                line_vert = (ymax - ymin) >= (xmax - xmin)
-
-                b_updated = dict(b)
-                b_updated['pts'] = new_pts_arr.tolist()
-                b_updated['xmin'] = xmin
-                b_updated['xmax'] = xmax
-                b_updated['ymin'] = ymin
-                b_updated['ymax'] = ymax
-                b_updated['cx'] = (xmin + xmax) / 2.0
-                b_updated['cy'] = (ymin + ymax) / 2.0
-
-                results.append({
-                    "box": b_updated,
-                    "text": text,
-                    "confidence": avg_conf,
-                    "is_vertical": line_vert,
-                    "is_furigana": False
-                })
-
-        return results
 
     def _ocr_single_chunk(self, img: Image.Image) -> list[Bubble]:
         if img.mode != "RGB":
@@ -1803,6 +1751,7 @@ class PPOCRv6Manga(Engine):
         if not raw_boxes:
             return []
 
+        # Area-weighted orientation voting
         vert_weight, horiz_weight = 0.0, 0.0
         for b in raw_boxes:
             bw = b['xmax'] - b['xmin']
@@ -1813,46 +1762,72 @@ class PPOCRv6Manga(Engine):
             elif bw > bh * 1.1:
                 horiz_weight += area
             else:
-                vert_weight += area * 0.5
+                if chunk_h >= chunk_w:
+                    vert_weight += area * 0.5
+                else:
+                    horiz_weight += area * 0.5
 
-        is_page_vertical = vert_weight >= horiz_weight
-        sorted_boxes = self._sort_reading_order_v2(raw_boxes, is_vertical=is_page_vertical)
+        is_vertical = vert_weight >= horiz_weight
+        sorted_boxes = self._sort_reading_order_v2(raw_boxes, is_vertical=is_vertical)
 
-        crops_data = []
+        # Line-by-line recognition with dynamic aspect ratio
+        temp_lines = []
         for b in sorted_boxes:
             crop, new_pts = self._get_rotate_crop_image(img_bgr, b['pts'])
-            if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
+            c_inp = self._prepare_rec_input(crop)
+            if c_inp is None:
                 continue
 
-            crop = self._clean_manga_vertical_crop(crop)
-            if crop.shape[0] > crop.shape[1]:
-                crop = cv2.rotate(crop, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            logits = self._run_rec(c_inp)
+            text = self._decode_ctc(logits)
 
-            ch, cw = crop.shape[:2]
-            natural_w = int(round(48.0 * cw / max(1, ch)))
-            target_w = max(16, min(2400 if natural_w > 2000 else 640, natural_w))
+            # Rejection patterns & droplet character filters
+            text = re.sub(r'\s+', '', text)
+            if not text or text in self.REJECT_PATTERNS:
+                continue
 
-            c_inp = cv2.resize(crop, (target_w, 48)).astype(np.float32)
-            c_inp = cv2.cvtColor(c_inp, cv2.COLOR_BGR2RGB) / 255.0
-            c_inp = ((c_inp - 0.5) / 0.5).transpose((2, 0, 1))
+            new_pts_arr = np.array(new_pts, dtype=np.float32)
+            xmin = float(np.min(new_pts_arr[:, 0]))
+            xmax = float(np.max(new_pts_arr[:, 0]))
+            ymin = float(np.min(new_pts_arr[:, 1]))
+            ymax = float(np.max(new_pts_arr[:, 1]))
+            bw = xmax - xmin
+            bh = ymax - ymin
+            area_box = bw * bh
 
-            crops_data.append({
-                'c_inp': c_inp,
-                'target_w': target_w,
-                'new_pts_arr': np.array(new_pts, dtype=np.float32),
-                'orig_box': b
+            if len(text) == 1 and (area_box < 400 or max(bw, bh) < 32 or text in self.DROPLET_CHARS or text.isascii()):
+                continue
+
+            line_vert = (bh >= bw)
+
+            b_updated = dict(b)
+            b_updated['pts'] = new_pts_arr.tolist()
+            b_updated['xmin'] = xmin
+            b_updated['xmax'] = xmax
+            b_updated['ymin'] = ymin
+            b_updated['ymax'] = ymax
+            b_updated['cx'] = (xmin + xmax) / 2.0
+            b_updated['cy'] = (ymin + ymax) / 2.0
+
+            temp_lines.append({
+                "box": b_updated,
+                "text": text,
+                "score": round(b['score'], 3),
+                "orientation": "vertical" if line_vert else "horizontal",
+                "pts": b_updated['pts'],
+                "is_furigana": False
             })
 
-        temp_lines = self._recognize_lines_batched(crops_data)
         if not temp_lines:
             return []
 
+        # Semantic & Typography Furigana pairing
         if len(temp_lines) > 1:
             for i, l1 in enumerate(temp_lines):
                 for j, l2 in enumerate(temp_lines):
                     if i == j:
                         continue
-                    if self._is_furigana_pair(l1, l2, is_vertical=is_page_vertical):
+                    if self._is_furigana_pair(l1, l2, is_vertical=is_vertical):
                         l1['is_furigana'] = True
                         break
 
@@ -1867,7 +1842,10 @@ class PPOCRv6Manga(Engine):
             bw = min(float(chunk_w), b['xmax']) - bx
             bh = min(float(chunk_h), b['ymax']) - by
 
-            orientation_angle = 90.0 if line['is_vertical'] else 0.0
+            if bw <= 0 or bh <= 0:
+                continue
+
+            orientation_angle = 90.0 if line['orientation'] == "vertical" else 0.0
 
             results_bubbles.append(Bubble(
                 text=line['text'],
@@ -1879,7 +1857,7 @@ class PPOCRv6Manga(Engine):
                 ),
                 orientation=float(round(orientation_angle, 1)),
                 font_size=0.04,
-                confidence=float(round(line['confidence'], 4))
+                confidence=float(round(line['score'], 4))
             ))
 
         return results_bubbles
@@ -1891,7 +1869,6 @@ class PPOCRv6Manga(Engine):
                 self._load_models()
 
         return await self._process_webtoon_chunked(img, self._ocr_single_chunk, "PPOCRv6Manga")
-
 
 def initialize_engine(engine_name: str) -> Engine:
     engine_name = engine_name.strip().lower()
