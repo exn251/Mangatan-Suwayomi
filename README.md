@@ -43,7 +43,7 @@ Add the following JSON configuration under **Parsing -> Extra Meta**:
 ```json
 [
   {
-    "host": "*://192.168.0.114:4570/manga/*",
+    "host": "*://127.0.0.1:4567/manga/*",
     "allFrames": true,
     "parserClass": "manga-ocr-parser",
     "parseVisibleObserver": true,
