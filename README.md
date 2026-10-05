@@ -44,6 +44,7 @@ Add the following JSON configuration under **Parsing -> Extra Meta**:
 [
   {
     "host": "*://127.0.0.1:4567/manga/*",
+    "auto": true,
     "allFrames": true,
     "parserClass": "manga-ocr-parser",
     "parseVisibleObserver": true,
