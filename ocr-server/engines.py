@@ -1149,9 +1149,9 @@ class PPOCRv6Manga(Engine):
     All-in-One Japanese Manga & Webtoon OCR Engine:
     - Detector: DBNet Manga Detector v0.2 FP16 (DirectML default -> CPU fallback)
     - Recognizer: PP-OCRv6 Manga v0.2 (DirectML default -> CPU fallback)
-    - Preprocessing & Furigana Trim: 1:1 with HF Space (BGR, dynamic width, 2-stage trim)
+    - Post-processing: PaddleOCR-standard 4-point unclip + vertical morphological bridge
+    - Anti-tilt: Snaps single characters and near-axis dialogue away from 45° diamond artifacts
     - Reading Order v2: Block-aware speech balloon union-find clustering
-    - False-positive droplet & noise filter: Restored DROPLET_CHARS
     - Auto-unloading maintenance thread
     """
 
@@ -1234,13 +1234,11 @@ class PPOCRv6Manga(Engine):
             self.dict_chars = ["blank"] + [line.strip("\r\n") for line in f] + [" "]
 
     def _verify_and_download_model_files(self):
-        # Detector is fine in FP16 (fast, coarse heatmap)
         try:
             self.det_path = self._resolve_or_download("det/manga_det_v0.2_fp16.onnx")
         except Exception:
             self.det_path = self._resolve_or_download("det/manga_det_v0.2.onnx")
 
-        # Recognizer prefers FP32 for DirectML precision
         try:
             self.rec_path = self._resolve_or_download(f"rec/manga_rec_{self.rec_version}.onnx")
         except Exception:
@@ -1320,18 +1318,18 @@ class PPOCRv6Manga(Engine):
         return out[0].astype(np.float32)
 
     @staticmethod
-    def _unclip_pp(box: np.ndarray, ratio: float = 1.4) -> Optional[np.ndarray]:
-        poly = Polygon(box)
+    def _unclip_box(box_4pts: np.ndarray, unclip_ratio: float = 1.4) -> Optional[np.ndarray]:
+        """PaddleOCR-standard unclipping on 4-point bounding boxes."""
+        poly = Polygon(box_4pts)
         if poly.area <= 0 or poly.length <= 0:
             return None
-        distance = poly.area * ratio / poly.length
-        off = pyclipper.PyclipperOffset()
-        off.AddPath(box, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
-        paths = off.Execute(distance)
-        if not paths:
+        distance = poly.area * unclip_ratio / poly.length
+        offset = pyclipper.PyclipperOffset()
+        offset.AddPath(box_4pts.tolist(), pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
+        expanded = offset.Execute(distance)
+        if not expanded:
             return None
-        paths = sorted(paths, key=lambda p: Polygon(np.array(p)).area if len(p) >= 3 else 0.0, reverse=True)
-        return np.array(paths[0], dtype=np.float32)
+        return np.array(expanded[0], dtype=np.float32)
 
     @staticmethod
     def _box_score_fast(pred: np.ndarray, box: np.ndarray) -> float:
@@ -1468,7 +1466,7 @@ class PPOCRv6Manga(Engine):
                     if alongside_ratio >= 0.85 and 15 <= right_area <= 0.35 * left_area and right_rows[0] < int(maxHeight * 0.75):
                         x2 = split_r
 
-            # 2. Symmetric Left trim (Stray margin / bubble border noise)
+            # 2. Symmetric Left trim
             l_start = max(3, int(maxWidth * 0.10))
             l_end = int(maxWidth * 0.25)
             l_zeros = [x for x in range(l_start, l_end) if proj[x] == 0]
@@ -1529,7 +1527,7 @@ class PPOCRv6Manga(Engine):
                 if alongside_ratio >= 0.85 and 15 <= right_area <= 0.35 * left_area and right_rows[0] < int(h * 0.75):
                     x2 = split_r
 
-        # Symmetric Left trim (Stray margin / bubble border noise)
+        # Symmetric Left trim
         l_start = max(3, int(w * 0.10))
         l_end = int(w * 0.25)
         l_zeros = [x for x in range(l_start, l_end) if proj[x] == 0]
@@ -1675,60 +1673,85 @@ class PPOCRv6Manga(Engine):
     def _detect_boxes_dbnet(self, img_bgr: np.ndarray) -> list[dict]:
         H, W = img_bgr.shape[:2]
 
-        margin = 16
-        pad_img = cv2.copyMakeBorder(img_bgr, margin, margin, margin, margin, cv2.BORDER_CONSTANT, value=[255, 255, 255])
-        pH, pW = pad_img.shape[:2]
-
-        target_max = max(pH, pW)
-        if target_max / min(pH, pW) > 2:
-            scale = min(1.0, (0.75 * 960.0 * 960.0 / (pH * pW)) ** 0.5)
+        target_max = max(H, W)
+        if target_max / min(H, W) > 2.0:
+            scale = min(1.0, (0.75 * 960.0 * 960.0 / (H * W)) ** 0.5)
         else:
-            scale = 960.0 / target_max if target_max > 960 else (max(1.0, 480.0 / target_max) if target_max < 480 else 1.0)
+            scale = 960.0 / target_max if target_max > 960 else 1.0
 
-        th = max(int(round(pH * scale / 32) * 32), 64)
-        tw = max(int(round(pW * scale / 32) * 32), 64)
+        th = max(int(round(H * scale / 32) * 32), 64)
+        tw = max(int(round(W * scale / 32) * 32), 64)
 
-        inp = cv2.resize(pad_img, (tw, th)).astype(np.float32) / 255.0
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        inp = cv2.resize(img_bgr, (tw, th), interpolation=interp).astype(np.float32) / 255.0
         inp = (inp - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225])
         inp_tensor = inp.transpose((2, 0, 1))[np.newaxis, ...]
 
         pred_map = self._run_det(inp_tensor)
 
+        # Morphological vertical closing to bridge breaks in the heatmap
         bitmap = pred_map > self.thresh
-        contours, _ = cv2.findContours((bitmap * 255).astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+        bitmap_closed = cv2.morphologyEx((bitmap * 255).astype(np.uint8), cv2.MORPH_CLOSE, vert_kernel)
+
+        contours, _ = cv2.findContours(bitmap_closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         raw_boxes = []
 
         for cnt in contours:
-            pts = cnt.squeeze(1)
-            if pts.ndim != 2 or pts.shape[0] < 4:
+            if cnt.shape[0] < 4:
                 continue
-            score = self._box_score_fast(pred_map, pts)
+
+            (rcx, rcy), (rw, rh), angle = cv2.minAreaRect(cnt)
+            sside = min(rw, rh)
+            if sside < 3:
+                continue
+
+            cnt_box = cv2.boxPoints(((rcx, rcy), (rw, rh), angle))
+            score = self._box_score_fast(pred_map, cnt_box)
             if score < self.box_thresh:
                 continue
 
-            unclipped = self._unclip_pp(pts, self.unclip_ratio)
+            # Unclip 4-point bounding box (PaddleOCR standard)
+            unclipped = self._unclip_box(cnt_box, self.unclip_ratio)
             if unclipped is None or len(unclipped) == 0:
                 continue
 
-            unclipped[:, 0] = unclipped[:, 0] * (pW / float(tw)) - margin
-            unclipped[:, 1] = unclipped[:, 1] * (pH / float(th)) - margin
-            xmin = max(0.0, float(np.min(unclipped[:, 0])))
-            xmax = min(float(W), float(np.max(unclipped[:, 0])))
-            ymin = max(0.0, float(np.min(unclipped[:, 1])))
-            ymax = min(float(H), float(np.max(unclipped[:, 1])))
-            if (xmax - xmin) < 6 or (ymax - ymin) < 6:
-                continue
+            unclipped[:, 0] = unclipped[:, 0] * (W / float(tw))
+            unclipped[:, 1] = unclipped[:, 1] * (H / float(th))
 
-            (rcx, rcy), (rw, rh), angle = cv2.minAreaRect(unclipped.astype(np.float32))
-            padded_rect = ((rcx, rcy), (rw + 4.0, rh + 4.0), angle)
-            box_4pts = cv2.boxPoints(padded_rect)
-            box_4pts[:, 0] = np.clip(box_4pts[:, 0], 0, W)
-            box_4pts[:, 1] = np.clip(box_4pts[:, 1], 0, H)
+            (rcx, rcy), (rw, rh), angle = cv2.minAreaRect(unclipped)
+
+            # Anti-tilt: Snap near-axis and short boxes to upright rectangles
+            aspect = max(rw, rh) / max(1.0, min(rw, rh))
+            angle_mod90 = abs(angle) % 90
+            is_near_axis = (angle_mod90 <= 8.0) or (angle_mod90 >= 82.0)
+            is_square_or_short = (aspect < 1.35) or (min(rw, rh) < 40)
+
+            if is_near_axis or is_square_or_short:
+                uxmin = max(0.0, float(np.min(unclipped[:, 0])))
+                uxmax = min(float(W), float(np.max(unclipped[:, 0])))
+                uymin = max(0.0, float(np.min(unclipped[:, 1])))
+                uymax = min(float(H), float(np.max(unclipped[:, 1])))
+
+                box_4pts = np.array([
+                    [uxmax, uymin],
+                    [uxmax, uymax],
+                    [uxmin, uymax],
+                    [uxmin, uymin]
+                ], dtype=np.float32)
+            else:
+                padded_rect = ((rcx, rcy), (rw + 2.0, rh + 2.0), angle)
+                box_4pts = cv2.boxPoints(padded_rect)
+                box_4pts[:, 0] = np.clip(box_4pts[:, 0], 0, W)
+                box_4pts[:, 1] = np.clip(box_4pts[:, 1], 0, H)
 
             xmin = max(0.0, float(np.min(box_4pts[:, 0])))
             xmax = min(float(W), float(np.max(box_4pts[:, 0])))
             ymin = max(0.0, float(np.min(box_4pts[:, 1])))
             ymax = min(float(H), float(np.max(box_4pts[:, 1])))
+
+            if (xmax - xmin) < 6 or (ymax - ymin) < 6:
+                continue
 
             raw_boxes.append({
                 'xmin': xmin, 'xmax': xmax, 'ymin': ymin, 'ymax': ymax,
@@ -1795,10 +1818,15 @@ class PPOCRv6Manga(Engine):
             bh = ymax - ymin
             area_box = bw * bh
 
-            if len(text) == 1 and (area_box < 400 or max(bw, bh) < 32 or text in self.DROPLET_CHARS or text.isascii()):
-                continue
+            is_kanji = self._contains_kanji(text)
+            
+            # Droplet noise filter: never drop valid kanji based purely on small box dimensions
+            if len(text) == 1 and not is_kanji:
+                if area_box < 300 or max(bw, bh) < 24 or text in self.DROPLET_CHARS or text.isascii():
+                    continue
 
-            line_vert = (bh >= bw)
+            aspect = max(bw, bh) / max(1.0, min(bw, bh))
+            line_vert = (bh >= bw) if aspect >= 1.25 else is_vertical
 
             b_updated = dict(b)
             b_updated['pts'] = new_pts_arr.tolist()
