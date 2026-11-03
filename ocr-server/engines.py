@@ -1167,7 +1167,7 @@ class PPOCRv6Manga(Engine):
         thresh: float = 0.15,
         box_thresh: float = 0.25,
         unclip_ratio: float = 1.4,
-        filter_furigana: bool = False,
+        filter_furigana: bool = True,
         rec_version: str = "v0.2",
         timeout_seconds: int = 600
     ):
